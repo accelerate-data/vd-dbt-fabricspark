@@ -1,5 +1,5 @@
 import re
-from concurrent.futures import Future
+from concurrent.futures import Future, as_completed
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -32,6 +32,7 @@ from dbt.adapters.base.impl import ConstraintSupport, catch_as_completed
 from dbt.adapters.base.relation import InformationSchema
 from dbt.adapters.contracts.relation import RelationConfig, RelationType
 from dbt.adapters.events.logging import AdapterLogger
+from dbt.adapters.exceptions import RelationReturnedMultipleResultsError
 from dbt.adapters.fabricspark import FabricSparkColumn, FabricSparkConnectionManager
 from dbt.adapters.fabricspark.relation import FabricSparkRelation
 from dbt.adapters.sql import SQLAdapter
@@ -46,6 +47,11 @@ DESCRIBE_TABLE_EXTENDED_MACRO_NAME = "describe_table_extended_without_caching"
 
 KEY_TABLE_OWNER = "Owner"
 KEY_TABLE_STATISTICS = "Statistics"
+
+# OneLake supported table types and their mapping to RelationType
+# OneLake's OnelakeExternalCatalog only supports: MANAGED, EXTERNAL, MATERIALIZED_LAKE_VIEW
+# Standard Spark VIEWs are NOT supported in OneLake
+ONELAKE_TYPE_REGEX = re.compile(r"Type:\s*(\w+)", re.IGNORECASE)
 
 TABLE_OR_VIEW_NOT_FOUND_MESSAGES = (
     "[TABLE_OR_VIEW_NOT_FOUND]",
@@ -138,6 +144,39 @@ class FabricSparkAdapter(SQLAdapter):
     def quote(self, identifier: str) -> str:
         return "`{}`".format(identifier)
 
+    def _schema_enabled(self) -> bool:
+        creds = getattr(self.config, "credentials", None)
+        return bool(getattr(creds, "lakehouse_schemas_enabled", False))
+
+    def _normalize_workspace_database(self, database: Optional[str]) -> Optional[str]:
+        if not database:
+            return database
+        parts = [part for part in database.replace("`", "").split(".") if part]
+        if len(parts) == 2:
+            return parts[1]
+        return database
+
+    def _normalize_schema_parts(
+        self, raw_schema: Optional[str]
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Normalize Fabric schema strings into (database, schema)."""
+        if raw_schema is None:
+            return None, None
+
+        cleaned = raw_schema.replace("`", "")
+        parts = [part for part in cleaned.split(".") if part]
+
+        if len(parts) >= 3:
+            # workspace.lakehouse.schema -> database=lakehouse, schema=schema
+            return parts[-2], parts[-1]
+        if len(parts) == 2:
+            # lakehouse.schema -> database=lakehouse, schema=schema
+            return parts[0], parts[1]
+        if len(parts) == 1:
+            # schema only
+            return None, parts[0]
+        return None, raw_schema
+
     def _get_relation_information(self, row: "agate.Row") -> RelationInfo:
         """relation info was fetched with SHOW TABLES EXTENDED"""
         try:
@@ -175,6 +214,36 @@ class FabricSparkAdapter(SQLAdapter):
 
         return _schema, name, information
 
+    def _parse_relation_type(self, information: str) -> RelationType:
+        """Parse the relation type from DESCRIBE EXTENDED information string.
+
+        OneLake's OnelakeExternalCatalog supports:
+        - MANAGED: Delta tables in /Tables folder
+        - EXTERNAL: Tables with explicit LOCATION
+        - MATERIALIZED_LAKE_VIEW: Fabric's materialized views (mapped to Table)
+
+        Standard Spark VIEWs are NOT supported in OneLake, but we still handle
+        them for backwards compatibility with other Spark environments.
+        """
+        type_match = ONELAKE_TYPE_REGEX.search(information)
+        if type_match:
+            raw_type = type_match.group(1).upper()
+            # Map OneLake types to RelationType
+            if raw_type == "VIEW":
+                return RelationType.View
+            elif raw_type in ("MANAGED", "EXTERNAL", "MATERIALIZED_LAKE_VIEW", "TABLE"):
+                return RelationType.Table
+            else:
+                # Log unknown types but default to Table to avoid errors
+                logger.debug(f"Unknown OneLake table type '{raw_type}', defaulting to Table")
+                return RelationType.Table
+
+        # Fallback: check for VIEW in the information string (legacy behavior)
+        if "Type: VIEW" in information:
+            return RelationType.View
+
+        return RelationType.Table
+
     def _build_spark_relation_list(
         self,
         row_list: "agate.Table",
@@ -184,13 +253,13 @@ class FabricSparkAdapter(SQLAdapter):
         relations = []
         for row in row_list:
             _schema, name, information = relation_info_func(row)
+            norm_database, norm_schema = self._normalize_schema_parts(_schema)
 
-            rel_type: RelationType = (
-                RelationType.View if "Type: VIEW" in information else RelationType.Table
-            )
+            rel_type: RelationType = self._parse_relation_type(information)
             is_delta: bool = "Provider: delta" in information
             relation: BaseRelation = self.Relation.create(
-                schema=_schema,
+                database=norm_database,
+                schema=norm_schema or _schema,
                 identifier=name,
                 type=rel_type,
                 information=information,
@@ -209,10 +278,11 @@ class FabricSparkAdapter(SQLAdapter):
         try:
             # Default compute engine behavior: show tables extended
             show_table_extended_rows = self.execute_macro(LIST_RELATIONS_MACRO_NAME, kwargs=kwargs)
-            return self._build_spark_relation_list(
+            x = self._build_spark_relation_list(
                 row_list=show_table_extended_rows,
                 relation_info_func=self._get_relation_information,
             )
+            return x
         except DbtRuntimeError as e:
             errmsg = getattr(e, "msg", "")
             if f"Database '{schema_relation}' not found" in errmsg:
@@ -240,11 +310,96 @@ class FabricSparkAdapter(SQLAdapter):
                 )
                 return []
 
+    def list_relations(self, database: Optional[str], schema: str) -> List[BaseRelation]:
+        if self._schema_enabled() and database is None:
+            database = getattr(self.config.credentials, "lakehouse", None)
+
+        cache_database = database
+        query_database = self._normalize_workspace_database(database)
+        if self._schema_is_cached(cache_database, schema):
+            return self.cache.get_relations(cache_database, schema)
+
+        schema_relation = self.Relation.create(
+            database=query_database,
+            schema=schema,
+            identifier="",
+            quote_policy=self.config.quoting,
+        ).without_identifier()
+
+        relations = self.list_relations_without_caching(schema_relation)
+
+        if self.cache:
+            if cache_database and cache_database != query_database:
+                adjusted = []
+                for relation in relations:
+                    adjusted.append(
+                        relation.incorporate(
+                            path={"database": cache_database},
+                            type=relation.type,
+                        )
+                    )
+                relations = adjusted
+            for relation in relations:
+                self.cache.add(relation)
+            if not relations:
+                self.cache.update_schemas([(cache_database, schema)])
+
+        return relations
+
+    def _relations_cache_for_schemas(
+        self,
+        relation_configs: Iterable[RelationConfig],
+        cache_schemas: Optional[Set[BaseRelation]] = None,
+    ) -> None:
+        """Populate the relations cache for the given schemas with logging."""
+        if not cache_schemas:
+            cache_schemas = self._get_cache_schemas(relation_configs)
+        with executor(self.config) as tpe:
+            futures: List[Future[List[BaseRelation]]] = []
+            for cache_schema in cache_schemas:
+                fut = tpe.submit_connected(
+                    self,
+                    f"list_{cache_schema.database}_{cache_schema.schema}",
+                    self.list_relations_without_caching,
+                    cache_schema,
+                )
+                futures.append(fut)
+
+            for future in as_completed(futures):
+                for relation in future.result():
+                    self.cache.add(relation)
+
+        cache_update: Set[Tuple[Optional[str], str]] = set()
+        for relation in cache_schemas:
+            if relation.schema:
+                db = relation.database
+                if self._schema_enabled() and db is None:
+                    db = getattr(self.config.credentials, "lakehouse", None)
+                cache_update.add((db, relation.schema))
+        self.cache.update_schemas(cache_update)
+
     def get_relation(self, database: str, schema: str, identifier: str) -> Optional[BaseRelation]:
         if not self.Relation.get_default_include_policy().database:
             database = None  # type: ignore
+        if self._schema_enabled() and database is None:
+            database = getattr(self.config.credentials, "lakehouse", None)
 
-        return super().get_relation(database, schema, identifier)
+        relations_list = self.list_relations(database, schema)
+
+        matches = self._make_match(relations_list, database, schema, identifier)
+
+        if len(matches) > 1:
+            kwargs = {
+                "identifier": identifier,
+                "schema": schema,
+                "database": database,
+            }
+            raise RelationReturnedMultipleResultsError(kwargs, matches)
+
+        if matches:
+            return matches[0]
+
+        return None
 
     def parse_describe_extended(
         self, relation: BaseRelation, raw_rows: AttrDict
@@ -263,7 +418,7 @@ class FabricSparkAdapter(SQLAdapter):
         table_stats = FabricSparkColumn.convert_table_stats(raw_table_stats)
         return [
             FabricSparkColumn(
-                table_database=None,
+                table_database=relation.database,
                 table_schema=relation.schema,
                 table_name=relation.name,
                 table_type=relation.type,
@@ -318,7 +473,7 @@ class FabricSparkAdapter(SQLAdapter):
         for match_num, match in enumerate(matches):
             column_name, column_type, nullable = match.groups()
             column = FabricSparkColumn(
-                table_database=None,
+                table_database=relation.database,
                 table_schema=relation.schema,
                 table_name=relation.table,
                 table_type=relation.type,
@@ -350,7 +505,7 @@ class FabricSparkAdapter(SQLAdapter):
             as_dict = column.to_column_dict()
             as_dict["column_name"] = as_dict.pop("column", None)
             as_dict["column_type"] = as_dict.pop("dtype")
-            as_dict["table_database"] = None
+            as_dict["table_database"] = relation.database
             yield as_dict
 
     def get_catalog(
@@ -359,10 +514,6 @@ class FabricSparkAdapter(SQLAdapter):
         used_schemas: FrozenSet[Tuple[str, str]],
     ) -> Tuple["agate.Table", List[Exception]]:
         schema_map = self._get_catalog_schemas(relation_configs)
-        if len(schema_map) > 1:
-            raise CompilationError(
-                f"Expected only one database in get_catalog, found " f"{list(schema_map)}"
-            )
 
         with executor(self.config) as tpe:
             futures: List[Future["agate.Table"]] = []
@@ -389,7 +540,7 @@ class FabricSparkAdapter(SQLAdapter):
     ) -> "agate.Table":
         if len(schemas) != 1:
             raise CompilationError(
-                f"Expected only one schema in spark _get_one_catalog, found " f"{schemas}"
+                f"Expected only one schema in spark _get_one_catalog, found {schemas}"
             )
 
         database = information_schema.database
@@ -452,9 +603,7 @@ class FabricSparkAdapter(SQLAdapter):
                 return cursor.fetchall()
             else:
                 return
-        except BaseException as e:
-            print(sql)
-            print(e)
+        except BaseException:
             raise
         finally:
             conn.transaction_open = False

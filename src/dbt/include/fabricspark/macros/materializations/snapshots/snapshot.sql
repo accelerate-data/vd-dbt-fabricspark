@@ -36,18 +36,24 @@
 
 
 {% macro spark_build_snapshot_staging_table(strategy, sql, target_relation) %}
+    {#-- OneLake's OnelakeExternalCatalog does NOT support standard Spark VIEWs.
+         Use a Delta table instead of a view for the staging relation.
+         This table will be dropped after the snapshot merge is complete. --#}
     {% set tmp_identifier = target_relation.identifier ~ '__dbt_tmp' %}
 
     {%- set tmp_relation = api.Relation.create(identifier=tmp_identifier,
                                               schema=target_relation.schema,
                                               database=none,
-                                              type='view') -%}
+                                              type='table') -%}
 
     {% set select = snapshot_staging_table(strategy, sql, target_relation) %}
 
-    {# needs to be a non-temp view so that its columns can be ascertained via `describe` #}
+    {# Create a Delta table for staging - views are not supported in OneLake #}
     {% call statement('build_snapshot_staging_relation') %}
-        {{ create_view_as(tmp_relation, select) }}
+        create or replace table {{ tmp_relation }}
+        using delta
+        as
+        {{ select }}
     {% endcall %}
 
     {% do return(tmp_relation) %}

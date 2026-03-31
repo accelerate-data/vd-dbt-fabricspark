@@ -296,7 +296,7 @@ class FabricSparkConnectionManager(SQLConnectionManager):
 
                 fire_event(
                     AdapterEventDebug(
-                        message=f"Got a retryable error {type(e)}. {retry_limit-attempt} retries left. Retrying in 5 seconds.\nError:\n{e}"
+                        message=f"Got a retryable error {type(e)}. {retry_limit - attempt} retries left. Retrying in 5 seconds.\nError:\n{e}"
                     )
                 )
                 time.sleep(5)
@@ -328,13 +328,13 @@ class FabricSparkConnectionManager(SQLConnectionManager):
 
             try:
                 _execute_query_with_retry(
-                cursor=cursor,
-                sql=sql,
-                bindings=bindings,
-                retryable_exceptions=retryable_exceptions,
-                retry_limit=retry_limit,
-                attempt=1,
-            )
+                    cursor=cursor,
+                    sql=sql,
+                    bindings=bindings,
+                    retryable_exceptions=retryable_exceptions,
+                    retry_limit=retry_limit,
+                    attempt=1,
+                )
             except Exception as ex:
                 query_exception = ex
 

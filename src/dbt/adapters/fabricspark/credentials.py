@@ -11,9 +11,32 @@ logger = AdapterLogger("fabricspark")
 
 @dataclass
 class FabricSparkCredentials(Credentials):
+    """Credentials for connecting to Microsoft Fabric Spark (OneLake).
+
+    Fabric Spark SQL supports four-part naming for cross-workspace queries:
+        workspace.lakehouse.schema.table
+
+    Configuration modes:
+    1. Two-part naming (standard lakehouse without schemas):
+       - SQL: lakehouse.table
+       - Config: schema=lakehouse_name
+
+    2. Three-part naming (schema-enabled lakehouse):
+       - SQL: lakehouse.schema.table
+       - Config: lakehouse_schemas_enabled=True, lakehouse=name, schema=schema_name
+
+    3. Four-part naming (cross-workspace queries):
+       - SQL: workspace.lakehouse.schema.table
+       - Use {{ source() }} or {{ ref() }} with workspace parameter
+       - Native Spark SQL support, no shortcuts required
+    """
+
     schema: Optional[str] = None  # type: ignore
     method: str = "livy"
     workspaceid: Optional[str] = None
+    workspace_name: Optional[str] = (
+        None  # Friendly name for current workspace (for four-part refs)
+    )
     database: Optional[str] = None  # type: ignore
     lakehouse: Optional[str] = None
     lakehouseid: Optional[str] = None
@@ -27,50 +50,63 @@ class FabricSparkCredentials(Credentials):
     create_shortcuts: Optional[bool] = False
     retry_all: bool = False
     shortcuts_json_str: Optional[str] = None
-    lakehouse_schemas_enabled: bool = False
+    lakehouse_schemas_enabled: bool = True
     accessToken: Optional[str] = None
     spark_config: Dict[str, Any] = field(default_factory=dict)
+    reuse_livy_session: bool = False
+    livy_session_path: Optional[str] = None
+    session_id_file: Optional[str] = None  # Alias for livy_session_path (for compatibility)
+    vdstudio_oauth_endpoint_url: Optional[str] = None
 
     @classmethod
     def __pre_deserialize__(cls, data: Any) -> Any:
         data = super().__pre_deserialize__(data)
+        if "database" not in data:
+            data["database"] = data["lakehouse"]
+            data["path"]["database"] = data["database"]
         if "lakehouse" not in data:
             data["lakehouse"] = None
         return data
 
     @property
     def lakehouse_endpoint(self) -> str:
-        # TODO: Construct Endpoint of the lakehouse from the
         return f"{self.endpoint}/workspaces/{self.workspaceid}/lakehouses/{self.lakehouseid}/livyapi/versions/2023-12-01"
 
     def __post_init__(self) -> None:
         if self.method is None:
             raise DbtRuntimeError("Must specify `method` in profile")
         if self.workspaceid is None:
-            raise DbtRuntimeError("Must specify `workspace guid` in profile")
+            raise DbtRuntimeError("Must specify `workspaceid` (workspace GUID) in profile")
         if self.lakehouseid is None:
-            raise DbtRuntimeError("Must specify `lakehouse guid` in profile")
+            raise DbtRuntimeError("Must specify `lakehouseid` (lakehouse GUID) in profile")
         if self.schema is None:
             raise DbtRuntimeError("Must specify `schema` in profile")
-        if self.database is not None:
-            raise DbtRuntimeError(
-                "database property is not supported by adapter. Set database as none and use lakehouse instead."
-            )
-        if self.lakehouse_schemas_enabled and self.schema is None:
-            raise DbtRuntimeError(
-                "Please provide a schema name because you enabled lakehouse schemas"
-            )
 
-        if not self.lakehouse_schemas_enabled and self.lakehouse is not None:
-            self.schema = self.lakehouse
+        # Schema-enabled lakehouse validation (three-part naming)
+        if self.lakehouse_schemas_enabled:
+            if self.database is None:
+                raise DbtRuntimeError(
+                    "Must specify `database` when lakehouse_schemas_enabled=True. "
+                    "This enables three-part naming: lakehouse.schema.table"
+                )
+            logger.debug(
+                f"Schema-enabled lakehouse: using three-part naming "
+                f"{self.database}.{self.schema}.table"
+            )
+        else:
+            # Standard lakehouse (two-part naming)
+            if self.database is not None:
+                raise DbtRuntimeError(
+                    "database property is not supported for standard lakehouses. "
+                    "Set database to None and use lakehouse/schema instead. "
+                    "For three-part naming, set lakehouse_schemas_enabled=True."
+                )
 
-        """ Validate spark_config fields manually. """
-        # other keys - "archives", "conf", "tags", "driverMemory", "driverCores", "executorMemory", "executorCores", "numExecutors"
+        # Validate spark_config fields
         required_keys = ["name"]
-
         for key in required_keys:
             if key not in self.spark_config:
-                raise ValueError(f"Missing required key: {key}")
+                raise ValueError(f"Missing required key in spark_config: {key}")
 
     @property
     def type(self) -> str:
@@ -81,4 +117,26 @@ class FabricSparkCredentials(Credentials):
         return self.lakehouseid
 
     def _connection_keys(self) -> Tuple[str, ...]:
-        return "workspaceid", "lakehouseid", "lakehouse", "endpoint", "schema", "file_format"
+        return (
+            "workspaceid",
+            "workspace_name",
+            "lakehouseid",
+            "lakehouse",
+            "endpoint",
+            "schema",
+        )
+
+    def is_current_workspace(self, workspace_name: str) -> bool:
+        """Check if a workspace name refers to the current workspace.
+
+        Args:
+            workspace_name: The friendly name or ID to check
+
+        Returns:
+            True if it matches the current workspace
+        """
+        if self.workspace_name and workspace_name == self.workspace_name:
+            return True
+        if workspace_name == self.workspaceid:
+            return True
+        return False

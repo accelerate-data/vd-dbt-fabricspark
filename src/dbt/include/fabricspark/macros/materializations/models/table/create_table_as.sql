@@ -2,8 +2,11 @@
   {%- if language == 'sql' -%}
     {%- if temporary -%}
       {{ create_temporary_view(relation, compiled_code) }}
-    {%- else -%}      
-      {% if config.get('file_format') == 'delta' or relation.is_delta %}
+    {%- else -%}
+      {#-- OneLake defaults to Delta format, always use CREATE OR REPLACE for Delta tables
+           to avoid namespace resolution issues between friendly names and GUID namespaces --#}
+      {%- set file_format = config.get('file_format', 'delta') -%}
+      {% if file_format == 'delta' or relation.is_delta %}
         create or replace table {{ relation }}
       {% else %}
         create table {{ relation }}
@@ -39,7 +42,7 @@
     using {{ file_format }}
   {%- endif %}
 {%- endmacro -%}
-W
+
 {% macro tblproperties_clause() %}
   {{ return(adapter.dispatch('tblproperties_clause', 'dbt')()) }}
 {%- endmacro -%}

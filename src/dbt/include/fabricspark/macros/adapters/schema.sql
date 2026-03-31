@@ -20,5 +20,15 @@
 {% endmacro %}
 
 {% macro fabricspark__generate_database_name(custom_database_name=none, node=none) -%}
-  {% do return(None) %}
+  {%- if custom_database_name is none -%}
+    {%- if node is not none and node|attr('database') -%}
+      {{ return(node.database) }}
+    {%- elif 'config' in target -%}
+      {{ return(target.database) }}
+    {%- else -%}
+      {{ return(target.database) }}
+    {%- endif -%}
+  {%- else -%}
+    {{ return(custom_database_name) }}
+  {%- endif -%}
 {%- endmacro %}

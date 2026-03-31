@@ -315,3 +315,15 @@ $RECYCLE.BIN/
 
 # End of https://www.toptal.com/developers/gitignore/api/windows,macos,linux,visualstudiocode,python
 test.env
+
+# Local scratch/notes
+ANALYSIS.md
+FABRIC_NOTEBOOK_AUTH.md
+changes/
+dd.txt
+prompts/
+
+# Node.js (not a Node project)
+node_modules/
+package.json
+package-lock.json
