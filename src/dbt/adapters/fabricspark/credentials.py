@@ -61,11 +61,16 @@ class FabricSparkCredentials(Credentials):
     @classmethod
     def __pre_deserialize__(cls, data: Any) -> Any:
         data = super().__pre_deserialize__(data)
-        if "database" not in data:
-            data["database"] = data["lakehouse"]
-            data["path"]["database"] = data["database"]
-        if "lakehouse" not in data:
-            data["lakehouse"] = None
+        # database and lakehouse are synonyms — sync whichever is provided
+        # priority: database > lakehouse
+        db = data.get("database")
+        lh = data.get("lakehouse")
+        resolved = db or lh
+        data["database"] = resolved
+        data["lakehouse"] = resolved
+        if resolved:
+            data["path"]["database"] = resolved
+            data["path"]["lakehouse"] = resolved
         return data
 
     @property
@@ -81,6 +86,20 @@ class FabricSparkCredentials(Credentials):
             raise DbtRuntimeError("Must specify `lakehouseid` (lakehouse GUID) in profile")
         if self.schema is None:
             raise DbtRuntimeError("Must specify `schema` in profile")
+
+        # database and lakehouse are synonyms — keep them in sync
+        resolved = self.database or self.lakehouse
+        self.database = resolved
+        self.lakehouse = resolved
+
+        # If workspace_name is set, compose database as "workspace.lakehouse"
+        # so relations render as four-part names: workspace.lakehouse.schema.table
+        if self.workspace_name and self.database and "." not in self.database:
+            self.database = f"{self.workspace_name}.{self.database}"
+            self.lakehouse = self.database
+            logger.debug(
+                f"Workspace-qualified database: {self.database}"
+            )
 
         # Schema-enabled lakehouse validation (three-part naming)
         if self.lakehouse_schemas_enabled:

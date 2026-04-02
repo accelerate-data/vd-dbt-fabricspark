@@ -40,6 +40,8 @@ dependencies = [
     "azure-identity>=1.13.0",
     "azure-core>=1.26.4",
     "azure-cli>=2.60.0",
+    "PyJWT[crypto]>=2.8.0",
+    "requests>=2.31.0",
 ]
 
 [dependency-groups]

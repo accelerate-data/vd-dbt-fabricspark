@@ -31,12 +31,13 @@
 
   {% set can_clone_table = can_clone_table() %}
 
-  {%- if not existing_relation.is_delta -%}
+  {%- if existing_relation is not none and not existing_relation.is_delta -%}
     {% set invalid_format_msg -%}
       shallow clone requires to be 'delta' (default file format). Other file formats are not supported.
     {%- endset %}
     {% do exceptions.raise_compiler_error(invalid_format_msg) %}
-  {%- elif other_existing_relation and other_existing_relation.type == 'table' and can_clone_table -%}
+  {%- elif can_clone_table and (other_existing_relation is none or other_existing_relation.type == 'table') -%}
+    {# For cross-workspace defer, other_existing_relation may not be in cache. Attempt shallow clone directly. #}
 
       {%- set target_relation = this.incorporate(type='table') -%}
       {% if existing_relation is not none and not existing_relation.is_table %}
