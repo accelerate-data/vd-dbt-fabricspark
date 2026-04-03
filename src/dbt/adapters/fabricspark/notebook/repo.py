@@ -1,7 +1,8 @@
 """Git clone helper for dbt projects inside Fabric notebooks.
 
-Authenticates via GitHub App (app ID + installation ID + PEM key from
-Azure Key Vault) to obtain a short-lived installation token.
+Authenticates via GitHub App. All three credentials (app ID, installation
+ID, PEM key) are stored as Azure Key Vault secrets and fetched at runtime.
+A short-lived installation access token is obtained and used for cloning.
 """
 
 from __future__ import annotations
@@ -25,17 +26,17 @@ JWT_EXPIRY_SECONDS = 600  # GitHub allows max 10 minutes
 class RepoConfig:
     """Git repository coordinates and GitHub App credentials.
 
-    Authentication uses a GitHub App: the PEM private key is fetched from
-    Azure Key Vault at runtime, used to mint a JWT, which is exchanged for
-    a short-lived installation access token.
+    All three GitHub App credentials are Key Vault **secret names** — the
+    actual values are fetched from Azure Key Vault at runtime via
+    ``notebookutils.credentials.getSecret()``.
 
     Attributes:
         url: Repository HTTPS URL (e.g. "https://github.com/org/repo").
         branch: Branch to clone. Defaults to "main".
-        github_app_id: GitHub App ID.
-        github_installation_id: GitHub App installation ID.
-        github_pem_secret: Key Vault secret name that holds the PEM private key.
-        vault_url: Azure Key Vault URL for fetching the PEM key.
+        github_app_id: Key Vault secret name for the GitHub App ID.
+        github_installation_id: Key Vault secret name for the installation ID.
+        github_pem_secret: Key Vault secret name for the PEM private key.
+        vault_url: Azure Key Vault URL.
         token: Pre-resolved token (optional — skips GitHub App flow if set).
     """
 
@@ -116,14 +117,23 @@ def _resolve_token(repo: RepoConfig) -> str:
             "github_pem_secret, and vault_url"
         )
 
-    print("Fetching GitHub App PEM key from Key Vault")
-    pem_key = _get_secret_from_key_vault(repo.vault_url, repo.github_pem_secret)
+    # All three credentials are Key Vault secret names — fetch actual values
+    print("Fetching GitHub App credentials from Key Vault")
+    app_id = _get_secret_from_key_vault(repo.vault_url, repo.github_app_id)
+    installation_id = _get_secret_from_key_vault(
+        repo.vault_url, repo.github_installation_id
+    )
+    pem_key = _get_secret_from_key_vault(
+        repo.vault_url, repo.github_pem_secret
+    )
+
+    print(f"GitHub App ID resolved (secret: {repo.github_app_id})")
 
     print("Generating GitHub App JWT")
-    jwt_token = _create_github_app_jwt(repo.github_app_id, pem_key)
+    jwt_token = _create_github_app_jwt(app_id, pem_key)
 
     print("Exchanging JWT for installation access token")
-    return _get_installation_token(repo.github_installation_id, jwt_token)
+    return _get_installation_token(installation_id, jwt_token)
 
 
 def _get_secret_from_key_vault(vault_url: str, secret_name: str) -> str:

@@ -68,7 +68,7 @@ class FabricSparkCredentials(Credentials):
         resolved = db or lh
         data["database"] = resolved
         data["lakehouse"] = resolved
-        if resolved:
+        if resolved and "path" in data:
             data["path"]["database"] = resolved
             data["path"]["lakehouse"] = resolved
         return data

@@ -3397,6 +3397,8 @@ dependencies = [
     { name = "dbt-adapters" },
     { name = "dbt-common" },
     { name = "dbt-core" },
+    { name = "pyjwt", extra = ["crypto"] },
+    { name = "requests" },
 ]
 
 [package.dev-dependencies]
@@ -3419,6 +3421,8 @@ requires-dist = [
     { name = "dbt-adapters", specifier = ">=1.7,<2.0" },
     { name = "dbt-common", specifier = ">=1.10,<2.0" },
     { name = "dbt-core", specifier = ">=1.8.0" },
+    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.8.0" },
+    { name = "requests", specifier = ">=2.31.0" },
 ]
 
 [package.metadata.requires-dev]
