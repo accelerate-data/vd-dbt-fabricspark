@@ -82,7 +82,7 @@ def run_dbt(
     _run_dbt_deps(project_dir)
 
     # Bootstrap elementary if needed
-    _bootstrap_elementary(project_dir)
+    #_bootstrap_elementary(project_dir)
 
     # Build the dbt command args
     dbt_args = [

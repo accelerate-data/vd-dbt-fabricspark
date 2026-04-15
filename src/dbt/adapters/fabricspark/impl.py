@@ -1,5 +1,5 @@
 import re
-from concurrent.futures import Future, as_completed
+from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -355,7 +355,16 @@ class FabricSparkAdapter(SQLAdapter):
         if not cache_schemas:
             cache_schemas = self._get_cache_schemas(relation_configs)
         with executor(self.config) as tpe:
-            futures: List[Future[List[BaseRelation]]] = []
+            # Track each future with its originating cache_schema so we can
+            # normalize the relation's database to match the key that will
+            # later be used for cache lookups (see list_relations which does
+            # the same adjustment). Without this, relations get cached under
+            # the short database name returned by `SHOW TABLE EXTENDED`
+            # (e.g. 'salesforce') while the schemas-cache is keyed by the
+            # full manifest database (e.g. 'sampledata.salesforce') - causing
+            # cross-schema get_relation() calls (like Elementary's
+            # on-run-end hooks) to silently miss.
+            futures: List[Tuple[BaseRelation, Future[List[BaseRelation]]]] = []
             for cache_schema in cache_schemas:
                 fut = tpe.submit_connected(
                     self,
@@ -363,10 +372,18 @@ class FabricSparkAdapter(SQLAdapter):
                     self.list_relations_without_caching,
                     cache_schema,
                 )
-                futures.append(fut)
+                futures.append((cache_schema, fut))
 
-            for future in as_completed(futures):
-                for relation in future.result():
+            for cache_schema, future in futures:
+                relations = future.result()
+                cache_database = cache_schema.database
+                query_database = self._normalize_workspace_database(cache_database)
+                if cache_database and cache_database != query_database:
+                    relations = [
+                        r.incorporate(path={"database": cache_database}, type=r.type)
+                        for r in relations
+                    ]
+                for relation in relations:
                     self.cache.add(relation)
 
         cache_update: Set[Tuple[Optional[str], str]] = set()

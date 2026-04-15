@@ -38,7 +38,8 @@ Usage inside a Fabric notebook::
 from __future__ import annotations
 
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import List, Union
 
 from .environment import ConnectionConfig, setup_environment
 from .repo import RepoConfig, clone_repo
@@ -50,14 +51,23 @@ class DbtJobConfig:
     """Complete configuration for a dbt notebook job.
 
     Attributes:
-        command: Full dbt command string, e.g. "dbt run --select tag:orders".
+        command: A single dbt command string or a list of commands to run
+            sequentially. E.g. "dbt run --select tag:orders" or
+            ["dbt deps", "dbt build --select alpha_model --target ephemeral"].
         repo: Git repository coordinates and GitHub App auth config.
         connection: Fabric Lakehouse connection coordinates.
     """
 
-    command: str
+    command: Union[str, List[str]]
     repo: RepoConfig
     connection: ConnectionConfig
+
+    @property
+    def commands(self) -> List[str]:
+        """Normalize command to a list."""
+        if isinstance(self.command, str):
+            return [self.command]
+        return self.command
 
 
 def run_dbt_job(config: DbtJobConfig) -> DbtResult:
@@ -66,16 +76,21 @@ def run_dbt_job(config: DbtJobConfig) -> DbtResult:
     Steps:
       1. Set environment variables for dbt profiles.yml
       2. Clone the dbt project from Git (auth via GitHub App)
-      3. Execute the dbt command with logging and artifact persistence
+      3. Execute dbt command(s) sequentially with logging
+
+    When multiple commands are provided, they run in order. If any
+    command fails, execution stops and the failed result is returned.
 
     Args:
         config: Complete job configuration.
 
     Returns:
-        DbtResult with execution details.
+        DbtResult from the last executed command.
     """
-    # Derive job name from the command for logging
-    job_name = _derive_job_name(config.command)
+    commands = config.commands
+
+    # Derive job name from the first command for logging
+    job_name = _derive_job_name(commands[0])
 
     # 1. Environment setup
     setup_environment(config.connection, job_name)
@@ -83,8 +98,14 @@ def run_dbt_job(config: DbtJobConfig) -> DbtResult:
     # 2. Clone repo
     project_dir = clone_repo(config.repo)
 
-    # 3. Execute dbt
-    return run_dbt(config.command, project_dir)
+    # 3. Execute dbt command(s)
+    result = None
+    for i, cmd in enumerate(commands):
+        if len(commands) > 1:
+            print(f"\n--- Running command {i + 1}/{len(commands)}: {cmd} ---")
+        result = run_dbt(cmd, project_dir)
+
+    return result
 
 
 def _derive_job_name(command: str) -> str:

@@ -58,6 +58,7 @@ def clone_repo(
     Token resolution order:
       1. repo.token (pre-resolved — for testing or direct injection)
       2. GitHub App flow (app_id + installation_id + PEM from Key Vault)
+      3. No auth (public repo — tried automatically if credentials not provided)
 
     Args:
         repo: Git repository coordinates and auth config.
@@ -67,8 +68,8 @@ def clone_repo(
         The absolute path of the cloned project directory.
 
     Raises:
-        ValueError: If repo.url is empty or auth config is incomplete.
-        subprocess.CalledProcessError: If git clone fails.
+        ValueError: If repo.url is empty.
+        RuntimeError: If clone fails (with guidance on providing credentials).
     """
     if not repo.url:
         raise ValueError("repo.url is required")
@@ -77,31 +78,57 @@ def clone_repo(
     shutil.rmtree(clone_dir, ignore_errors=True)
     os.makedirs(os.path.dirname(clone_dir), exist_ok=True)
 
-    # Resolve token
+    # Resolve token (returns empty string if no credentials provided)
     token = _resolve_token(repo)
 
-    auth_url = repo.url.replace(
-        "https://", f"https://x-access-token:{token}@"
-    )
+    if token:
+        clone_url = repo.url.replace(
+            "https://", f"https://x-access-token:{token}@"
+        )
+    else:
+        # No credentials — try as public repo
+        print("No GitHub credentials provided, attempting public clone")
+        clone_url = repo.url
 
     clone_args = ["git", "clone", "--depth", "1"]
     if repo.branch:
         clone_args.extend(["-b", repo.branch])
-    clone_args.extend([auth_url, clone_dir])
+    clone_args.extend([clone_url, clone_dir])
 
-    subprocess.run(
+    result = subprocess.run(
         clone_args,
         capture_output=True,
         text=True,
         timeout=CLONE_TIMEOUT_SECONDS,
-        check=True,
     )
+
+    if result.returncode != 0:
+        if token:
+            # Auth was provided but clone still failed
+            raise RuntimeError(
+                f"git clone failed with authenticated URL.\n"
+                f"stderr: {result.stderr.strip()}"
+            )
+        else:
+            # No auth was provided and clone failed — likely a private repo
+            raise RuntimeError(
+                f"git clone failed for {repo.url}. If this is a private repository, "
+                f"provide GitHub App credentials (github_app_id, "
+                f"github_installation_id, github_pem_secret, vault_url) or "
+                f"a pre-resolved token.\n"
+                f"stderr: {result.stderr.strip()}"
+            )
+
     print(f"Cloned {repo.url} (branch: {repo.branch}) into {clone_dir}")
     return clone_dir
 
 
 def _resolve_token(repo: RepoConfig) -> str:
-    """Resolve a GitHub installation access token."""
+    """Resolve a GitHub installation access token.
+
+    Returns an empty string if no credentials are configured,
+    allowing the caller to attempt an unauthenticated clone.
+    """
     if repo.token:
         print("Using pre-resolved GitHub token")
         return repo.token
@@ -112,10 +139,7 @@ def _resolve_token(repo: RepoConfig) -> str:
         and repo.github_pem_secret
         and repo.vault_url
     ):
-        raise ValueError(
-            "GitHub App auth requires: github_app_id, github_installation_id, "
-            "github_pem_secret, and vault_url"
-        )
+        return ""
 
     # All three credentials are Key Vault secret names — fetch actual values
     print("Fetching GitHub App credentials from Key Vault")
