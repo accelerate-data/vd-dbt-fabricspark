@@ -1,15 +1,18 @@
 from dataclasses import dataclass, field
-from typing import Optional, TypeVar
+from typing import Any, ClassVar, Dict, Optional, TypeVar
 
 from dbt_common.utils import deep_merge
 
 from dbt.adapters.base.relation import BaseRelation, Policy
-from dbt.adapters.contracts.relation import HasQuoting, RelationConfig
+from dbt.adapters.contracts.relation import HasQuoting, RelationConfig, RelationType
 from dbt.adapters.events.logging import AdapterLogger
 
 logger = AdapterLogger("fabricspark")
 
 Self = TypeVar("Self", bound="BaseRelation")
+
+# Valid RelationType values
+_VALID_RELATION_TYPES = {t.value for t in RelationType}
 
 
 @dataclass
@@ -88,8 +91,23 @@ class FabricSparkRelation(BaseRelation):
     - VIEWs are NOT supported
     """
 
+    # Class-level flag set once by the connection manager after detecting schema support.
+    # Controls the default include_policy for all relations created after it is set:
+    #   True  → three-part naming: database.schema.identifier (lakehouse.schema.table)
+    #   False → two-part naming:   schema.identifier (lakehouse.table)
+    #
+    # Macros can still override per-relation via .include(database=false, schema=false)
+    # for temporary views which require unqualified identifiers.
+    _schemas_enabled: ClassVar[bool] = False
+
     quote_policy: Policy = field(default_factory=lambda: FabricSparkQuotePolicy())
-    include_policy: Policy = field(default_factory=lambda: FabricSparkIncludePolicy())
+    include_policy: Policy = field(
+        default_factory=lambda: FabricSparkIncludePolicy(
+            database=FabricSparkRelation._schemas_enabled,
+            schema=True,
+            identifier=True,
+        )
+    )
     quote_character: str = "`"
     is_delta: Optional[bool] = None
     information: Optional[str] = None
@@ -97,7 +115,6 @@ class FabricSparkRelation(BaseRelation):
     workspace: Optional[str] = None
 
     def incorporate(self, **kwargs):
-        print("========= incorporate called with kwargs:", kwargs)
         t = kwargs.get("type")
 
         # dbt/jinja may pass an Undefined sentinel (or "Undefined" as a string)
@@ -106,6 +123,21 @@ class FabricSparkRelation(BaseRelation):
             kwargs.pop("type", None)  # or: kwargs["type"] = None
 
         return super().incorporate(**kwargs)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "FabricSparkRelation":
+        # Sanitize 'type' field: Jinja Undefined or invalid strings become None
+        if "type" in data and data["type"] is not None:
+            type_val = data["type"]
+            if not isinstance(type_val, RelationType):
+                type_str = str(type_val)
+                if type_str not in _VALID_RELATION_TYPES:
+                    logger.debug(
+                        f"Replacing invalid relation type '{type_str}' with None"
+                    )
+                    data = dict(data)
+                    data["type"] = None
+        return super().from_dict(data)
 
     def __post_init__(self) -> None:
         # Validation is relaxed to allow flexible naming patterns
@@ -154,7 +186,6 @@ class FabricSparkRelation(BaseRelation):
 
         return ".".join(parts)
 
-    @classmethod
     @classmethod
     def create_from(
         cls,
@@ -253,8 +284,6 @@ class FabricSparkRelation(BaseRelation):
     @property
     def is_table(self) -> bool:
         """Check if this relation is a table type."""
-        from dbt.adapters.contracts.relation import RelationType
-
         return self.type == RelationType.Table
 
     @property
@@ -263,8 +292,6 @@ class FabricSparkRelation(BaseRelation):
 
         Note: OneLake does NOT support standard Spark VIEWs.
         """
-        from dbt.adapters.contracts.relation import RelationType
-
         return self.type == RelationType.View
 
     @property

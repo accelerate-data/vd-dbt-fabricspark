@@ -27,7 +27,12 @@ from dbt.adapters.contracts.connection import (
 from dbt.adapters.events.logging import AdapterLogger
 from dbt.adapters.events.types import AdapterEventDebug, ConnectionUsed, SQLQuery, SQLQueryStatus
 from dbt.adapters.exceptions import FailedToConnectError
-from dbt.adapters.fabricspark.livysession import LivySessionConnectionWrapper, LivySessionManager
+from dbt.adapters.fabricspark.livysession import (
+    LivySessionConnectionWrapper,
+    LivySessionManager,
+    get_lakehouse_properties,
+)
+from dbt.adapters.fabricspark.relation import FabricSparkRelation
 from dbt.adapters.sql import SQLConnectionManager
 
 logger = AdapterLogger("Microsoft Fabric-Spark")
@@ -87,6 +92,7 @@ class FabricSparkConnectionManager(SQLConnectionManager):
 
     connection_managers = {}
     spark_version = None
+    mlv_prereq_error: Optional[str] = None
 
     @contextmanager
     def exception_handler(self, sql: str) -> Generator[None, None, None]:
@@ -149,6 +155,15 @@ class FabricSparkConnectionManager(SQLConnectionManager):
         exc = None
         handle: FabricSparkConnectionWrapper = None
 
+        # Fetch lakehouse properties and detect schema support (Fabric mode only).
+        if not creds.is_local_mode:
+            lakehouse_props = get_lakehouse_properties(creds)
+            creds.apply_lakehouse_properties(lakehouse_props)
+
+        # Set the adapter-wide naming mode: all relations render uniformly as
+        # either two-part (schema.table) or three-part (lakehouse.schema.table).
+        FabricSparkRelation._schemas_enabled = creds.lakehouse_schemas_enabled
+
         for i in range(1 + creds.connect_retries):
             try:
                 if creds.method == FabricSparkConnectionMethod.LIVY:
@@ -200,19 +215,30 @@ class FabricSparkConnectionManager(SQLConnectionManager):
 
         connection.handle = handle
         connection.state = ConnectionState.OPEN
+
+        # Cache the Spark version for downstream checks (e.g. MLV runtime requirement).
+        cls.fetch_spark_version(connection)
+
+        # Eagerly validate MLV prerequisites and cache the result.
+        # Logs a warning immediately so it's visible before any model runs.
+        cls.check_mlv_prerequisites(connection)
+
         return connection
 
     @classmethod
     def release(self) -> None:
         pass
 
-    @classmethod
     def cleanup_all(self) -> None:
-        for thread_id in self.connection_managers:
-            livySession = self.connection_managers[thread_id]
-            livySession.disconnect()
+        """Clean up connection manager references only.
 
-            # garbage collect these connections
+        Does NOT call super().cleanup_all() because that clears
+        thread_connections, which breaks subsequent dbt invocations
+        within the same process (e.g. seed → run → show in tests).
+        Connections must persist because the Livy session is shared.
+        Sessions are deleted on process exit via an atexit handler
+        registered in LivySessionManager.
+        """
         self.connection_managers.clear()
 
     @classmethod
@@ -246,7 +272,7 @@ class FabricSparkConnectionManager(SQLConnectionManager):
             return FabricSparkConnectionManager.spark_version
 
         try:
-            sql = "split(version(), ' ')[0] as version"
+            sql = "SELECT split(version(), ' ')[0] as version"
             cursor = connection.handle.cursor()
             cursor.execute(sql)
             res = cursor.fetchall()
@@ -259,6 +285,62 @@ class FabricSparkConnectionManager(SQLConnectionManager):
 
         os.environ["DBT_SPARK_VERSION"] = FabricSparkConnectionManager.spark_version
         logger.debug(f"SPARK VERSION {os.getenv('DBT_SPARK_VERSION')}")
+
+    MLV_MIN_SPARK_VERSION = "3.5"
+
+    @classmethod
+    def check_mlv_prerequisites(cls, connection) -> None:
+        """Validate MLV prerequisites at connection open time and cache the result.
+
+        If prerequisites are not met, stores the error message in
+        ``cls.mlv_prereq_error`` and logs a warning. Does NOT raise —
+        non-MLV models should not be affected. The MLV materialization
+        reads the cached error and fails instantly.
+        """
+        creds = connection.credentials
+
+        # 1. Local mode
+        if creds.is_local_mode:
+            cls.mlv_prereq_error = (
+                "Materialized Lake Views require Fabric Runtime 1.3+. "
+                "Local mode (Docker Spark) does not support MLV."
+            )
+            logger.warning(f"MLV prerequisite not met: {cls.mlv_prereq_error}")
+            return
+
+        # 2. Spark version
+        spark_version = cls.spark_version or ""
+        if spark_version:
+            try:
+                major_minor = ".".join(spark_version.split(".")[:2])
+                if tuple(int(x) for x in major_minor.split(".")) < tuple(
+                    int(x) for x in cls.MLV_MIN_SPARK_VERSION.split(".")
+                ):
+                    cls.mlv_prereq_error = (
+                        f"Materialized Lake Views require Fabric Runtime 1.3+ "
+                        f"(Apache Spark >= {cls.MLV_MIN_SPARK_VERSION}). "
+                        f"Detected Spark version: {spark_version}."
+                    )
+                    logger.warning(f"MLV prerequisite not met: {cls.mlv_prereq_error}")
+                    return
+            except Exception:
+                logger.warning(
+                    f"Could not parse Spark version '{spark_version}' for MLV check. "
+                    f"MLV models may fail at runtime."
+                )
+
+        # 3. Schema-enabled lakehouse
+        if not creds.lakehouse_schemas_enabled:
+            cls.mlv_prereq_error = (
+                "Materialized Lake Views require a schema-enabled lakehouse. "
+                "The target lakehouse does not have schemas enabled."
+            )
+            logger.warning(f"MLV prerequisite not met: {cls.mlv_prereq_error}")
+            return
+
+        # All checks passed
+        cls.mlv_prereq_error = None
+        logger.debug("MLV prerequisites validated successfully at connection open.")
 
     def add_query(
         self,
@@ -289,17 +371,22 @@ class FabricSparkConnectionManager(SQLConnectionManager):
             retry_limit = connection.credentials.connect_retries or 3
             try:
                 cursor.execute(sql, bindings)
-            except retryable_exceptions as e:
+            except Exception as e:
+                is_type_retryable = isinstance(e, retryable_exceptions) if retryable_exceptions else False
+                retryable_message = _is_retryable_error(e)
+                if not is_type_retryable and not retryable_message:
+                    raise e
+
                 # Cease retries and fail when limit is hit.
                 if attempt >= retry_limit:
                     raise e
 
                 fire_event(
                     AdapterEventDebug(
-                        message=f"Got a retryable error {type(e)}. {retry_limit - attempt} retries left. Retrying in 5 seconds.\nError:\n{e}"
+                        message=f"Got a retryable error {type(e)}. {retry_limit-attempt} retries left. Retrying in {min(5 * (2 ** (attempt - 1)), 60)} seconds.\nError:\n{e}"
                     )
                 )
-                time.sleep(5)
+                time.sleep(min(5 * (2 ** (attempt - 1)), 60))
 
                 return _execute_query_with_retry(
                     cursor=cursor,
@@ -328,13 +415,13 @@ class FabricSparkConnectionManager(SQLConnectionManager):
 
             try:
                 _execute_query_with_retry(
-                    cursor=cursor,
-                    sql=sql,
-                    bindings=bindings,
-                    retryable_exceptions=retryable_exceptions,
-                    retry_limit=retry_limit,
-                    attempt=1,
-                )
+                cursor=cursor,
+                sql=sql,
+                bindings=bindings,
+                retryable_exceptions=retryable_exceptions,
+                retry_limit=retry_limit,
+                attempt=1,
+            )
             except Exception as ex:
                 query_exception = ex
 
@@ -367,6 +454,7 @@ def _is_retryable_error(exc: Exception) -> str:
         "rate limit",
         "connection reset",
         "service busy",
+        "unable to fetch mwc token",
     ]
     for keyword in retryable_keywords:
         if keyword in message:

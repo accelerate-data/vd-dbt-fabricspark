@@ -32,28 +32,24 @@
     and DBT_INTERNAL_SOURCE.dbt_change_type = 'insert'
     then insert *
     ;
-{% endmacro %}
+{%- endmacro %}
 
 
 {% macro spark_build_snapshot_staging_table(strategy, sql, target_relation) %}
-    {#-- OneLake's OnelakeExternalCatalog does NOT support standard Spark VIEWs.
-         Use a Delta table instead of a view for the staging relation.
-         This table will be dropped after the snapshot merge is complete. --#}
     {% set tmp_identifier = target_relation.identifier ~ '__dbt_tmp' %}
 
+    {#-- Persisted view (non-temp) so that its columns can be ascertained via `describe`.
+         Inherits database/schema from target_relation for proper 2-part or 3-part naming. --#}
     {%- set tmp_relation = api.Relation.create(identifier=tmp_identifier,
                                               schema=target_relation.schema,
-                                              database=none,
-                                              type='table') -%}
+                                              database=target_relation.database,
+                                              type='view') -%}
 
     {% set select = snapshot_staging_table(strategy, sql, target_relation) %}
 
-    {# Create a Delta table for staging - views are not supported in OneLake #}
+    {# needs to be a non-temp view so that its columns can be ascertained via `describe` #}
     {% call statement('build_snapshot_staging_relation') %}
-        create or replace table {{ tmp_relation }}
-        using delta
-        as
-        {{ select }}
+        {{ create_view_as(tmp_relation, select) }}
     {% endcall %}
 
     {% do return(tmp_relation) %}
@@ -111,9 +107,8 @@
     {% endif %}
   {% endif %}
 
-  {% if not adapter.check_schema_exists(model.database, model.schema) %}
-    {% do create_schema(model.schema) %}
-  {% endif %}
+  {#-- Ensure the database/schema exists before creating the snapshot table --#}
+  {% do ensure_database_exists(model.schema, database=model.database) %}
 
   {%- if not target_relation.is_table -%}
     {% do exceptions.relation_wrong_type(target_relation, 'table') %}
