@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import datetime as dt
+import fcntl
 import json
 import os
 import re
@@ -98,6 +100,72 @@ def write_session_id_to_file(file_path: str, session_id: str) -> bool:
     except Exception as ex:
         logger.warning(f"Error writing session ID to file: {ex}")
         return False
+
+
+@contextlib.contextmanager
+def cross_process_session_lock(session_file_path: str, timeout: int = 600):
+    """Cross-process file lock for Livy session creation.
+
+    When multiple dbt processes start simultaneously (e.g. parallel sub-agent
+    commands), only the first process should create a Spark session.  Other
+    processes block on this lock until the first one writes the session ID
+    file, then reuse that session.
+
+    Uses fcntl.flock (advisory lock) on a .lock file next to the session ID
+    file.  The lock is automatically released when the context exits or the
+    process dies.
+
+    Note: upstream's ``reuse_session`` flag was designed for **sequential**
+    session reuse (Run 1 exits → Run 2 starts and reuses).  This lock adds
+    **parallel** session sharing across concurrent processes.  When
+    ``reuse_session=False`` (the default), the atexit handler will still
+    attempt to delete the Spark session — if Process 1 exits before
+    Processes 2-7 finish, those processes may lose the session.  For
+    parallel workloads, set ``reuse_session=True`` and let Fabric's idle
+    timeout handle cleanup, or accept that short-lived parallel commands
+    may occasionally need to recreate the session.
+
+    Parameters
+    ----------
+    session_file_path : str
+        Path to the session ID file.  The lock file is ``<path>.lock``.
+    timeout : int
+        Max seconds to wait for the lock before giving up (default 600s /
+        10 minutes — enough for Spark cluster cold start).
+    """
+    lock_path = session_file_path + ".lock"
+    lock_dir = os.path.dirname(lock_path)
+    if lock_dir and not os.path.exists(lock_dir):
+        os.makedirs(lock_dir, exist_ok=True)
+
+    lock_fd = None
+    try:
+        lock_fd = open(lock_path, "w")
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                logger.debug(f"Acquired cross-process session lock: {lock_path}")
+                break
+            except (OSError, BlockingIOError):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Timed out waiting {timeout}s for session lock {lock_path}. "
+                        f"Another dbt process may be stuck creating a Spark session. "
+                        f"Delete {lock_path} to unblock."
+                    )
+                logger.debug(
+                    f"Session lock held by another process, waiting... ({lock_path})"
+                )
+                time.sleep(2)
+        yield
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                lock_fd.close()
+            except Exception:
+                pass
 
 
 def is_token_refresh_necessary(unixTimestamp: int) -> bool:
@@ -1067,21 +1135,32 @@ class LivySessionManager:
         """Connect to a Livy session.
 
         For local mode: reuses existing sessions via session ID file persistence.
-        For Fabric mode: always creates a new session.
+        For Fabric mode: creates a new session or reuses an existing one.
 
-        This method is thread-safe and uses a lock to prevent race conditions
-        when multiple threads attempt to create sessions simultaneously.
+        This method is both thread-safe (via ``_session_lock``) and
+        process-safe (via ``cross_process_session_lock``).  When multiple
+        dbt processes start simultaneously (e.g. parallel Claude Code
+        sub-agent commands), the cross-process file lock ensures only one
+        process creates the Spark session while others wait and reuse it.
         """
-        with _session_lock:
-            spark_config = credentials.spark_config
+        session_file = credentials.resolved_session_id_file
 
-            if credentials.is_local_mode:
-                LivySessionManager._connect_local(credentials, spark_config)
-            else:
-                LivySessionManager._connect_fabric(credentials, spark_config)
+        # Cross-process lock: prevents 7 parallel dbt processes from each
+        # creating their own Spark session.  The first process to acquire
+        # the lock creates the session and writes its ID to the session
+        # file.  Waiting processes re-check the file after the lock is
+        # released and reuse the existing session.
+        with cross_process_session_lock(session_file):
+            with _session_lock:
+                spark_config = credentials.spark_config
 
-            livyConnection = LivyConnection(credentials, LivySessionManager.livy_global_session)
-            return livyConnection
+                if credentials.is_local_mode:
+                    LivySessionManager._connect_local(credentials, spark_config)
+                else:
+                    LivySessionManager._connect_fabric(credentials, spark_config)
+
+                livyConnection = LivyConnection(credentials, LivySessionManager.livy_global_session)
+                return livyConnection
 
     @staticmethod
     def _connect_local(credentials: FabricSparkCredentials, spark_config) -> None:
@@ -1144,19 +1223,47 @@ class LivySessionManager:
 
     @staticmethod
     def _connect_fabric_fresh(credentials: FabricSparkCredentials, spark_config) -> None:
-        """Connect in Fabric mode — always creates a new session."""
-        session = LivySessionManager.livy_global_session
-        needs_new_session = (
-            session is None
-            or not session.is_valid_session()
-            or session.is_new_session_required
-        )
+        """Connect in Fabric mode — creates a new session or reuses one.
 
-        if not needs_new_session:
-            logger.debug(f"Reusing session: {session.session_id}")
+        Even when ``reuse_session`` is False, this method now checks the
+        session ID file for cross-process sharing.  When multiple dbt
+        processes start simultaneously (e.g. parallel sub-agent commands),
+        the first process creates the session and writes its ID to the
+        file.  Later processes (arriving after the cross-process lock is
+        released) read the file and reuse that session instead of creating
+        a duplicate.
+
+        The session is still deleted at process exit (atexit handler),
+        unless ``reuse_session`` is True.
+        """
+        session = LivySessionManager.livy_global_session
+
+        # 1. Fast path: reuse current in-memory session if it's valid
+        if session is not None and session.is_valid_session() and not session.is_new_session_required:
+            logger.debug(f"Reusing in-memory session: {session.session_id}")
             return
 
+        # 2. Cross-process path: another process may have created a session
+        #    while we were waiting on the file lock.  Check the session file.
+        session_file_path = credentials.resolved_session_id_file
+        existing_session_id = read_session_id_from_file(session_file_path)
+        if existing_session_id:
+            if session is None:
+                session = LivySession(credentials)
+                LivySessionManager.livy_global_session = session
+            if session.session_id != existing_session_id:
+                if session.try_reuse_session(existing_session_id):
+                    logger.info(
+                        f"Reusing session from another process: {existing_session_id}"
+                    )
+                    return
+
+        # 3. No reusable session — create a new one and persist for siblings
         LivySessionManager._create_fabric_session(credentials, spark_config)
+        write_session_id_to_file(
+            session_file_path,
+            LivySessionManager.livy_global_session.session_id,
+        )
 
     @staticmethod
     def _connect_fabric_reuse(credentials: FabricSparkCredentials, spark_config) -> None:

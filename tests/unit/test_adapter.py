@@ -639,6 +639,7 @@ class TestOneLakeRelationTypeParsing(unittest.TestCase):
 
     def setUp(self):
         flags.STRICT_MODE = False
+        self.mp_context = get_context("spawn")
         self.project_cfg = {
             "name": "X",
             "version": "0.1",
@@ -665,6 +666,7 @@ class TestOneLakeRelationTypeParsing(unittest.TestCase):
                         "connect_timeout": 10,
                         "threads": 1,
                         "endpoint": "https://dailyapi.fabric.microsoft.com/v1",
+                        "spark_config": {"name": "test-session"},
                     }
                 },
                 "target": "test",
@@ -674,7 +676,7 @@ class TestOneLakeRelationTypeParsing(unittest.TestCase):
     def test_parse_relation_type_managed(self):
         """MANAGED tables should map to RelationType.Table"""
         config = self._get_config()
-        adapter = FabricSparkAdapter(config)
+        adapter = FabricSparkAdapter(config, self.mp_context)
         information = "Type: MANAGED\nProvider: delta\n"
         result = adapter._parse_relation_type(information)
         self.assertEqual(result, RelationType.Table)
@@ -682,7 +684,7 @@ class TestOneLakeRelationTypeParsing(unittest.TestCase):
     def test_parse_relation_type_external(self):
         """EXTERNAL tables should map to RelationType.Table"""
         config = self._get_config()
-        adapter = FabricSparkAdapter(config)
+        adapter = FabricSparkAdapter(config, self.mp_context)
         information = "Type: EXTERNAL\nProvider: delta\n"
         result = adapter._parse_relation_type(information)
         self.assertEqual(result, RelationType.Table)
@@ -690,7 +692,7 @@ class TestOneLakeRelationTypeParsing(unittest.TestCase):
     def test_parse_relation_type_materialized_lake_view(self):
         """MATERIALIZED_LAKE_VIEW should map to RelationType.Table"""
         config = self._get_config()
-        adapter = FabricSparkAdapter(config)
+        adapter = FabricSparkAdapter(config, self.mp_context)
         information = "Type: MATERIALIZED_LAKE_VIEW\nProvider: delta\n"
         result = adapter._parse_relation_type(information)
         self.assertEqual(result, RelationType.Table)
@@ -698,7 +700,7 @@ class TestOneLakeRelationTypeParsing(unittest.TestCase):
     def test_parse_relation_type_view(self):
         """VIEW should map to RelationType.View"""
         config = self._get_config()
-        adapter = FabricSparkAdapter(config)
+        adapter = FabricSparkAdapter(config, self.mp_context)
         information = "Type: VIEW\n"
         result = adapter._parse_relation_type(information)
         self.assertEqual(result, RelationType.View)
@@ -706,7 +708,7 @@ class TestOneLakeRelationTypeParsing(unittest.TestCase):
     def test_parse_relation_type_table(self):
         """TABLE should map to RelationType.Table"""
         config = self._get_config()
-        adapter = FabricSparkAdapter(config)
+        adapter = FabricSparkAdapter(config, self.mp_context)
         information = "Type: TABLE\nProvider: delta\n"
         result = adapter._parse_relation_type(information)
         self.assertEqual(result, RelationType.Table)
@@ -714,7 +716,7 @@ class TestOneLakeRelationTypeParsing(unittest.TestCase):
     def test_parse_relation_type_unknown_defaults_to_table(self):
         """Unknown types should default to RelationType.Table"""
         config = self._get_config()
-        adapter = FabricSparkAdapter(config)
+        adapter = FabricSparkAdapter(config, self.mp_context)
         information = "Type: UNKNOWN_TYPE\nProvider: delta\n"
         result = adapter._parse_relation_type(information)
         self.assertEqual(result, RelationType.Table)
@@ -722,7 +724,7 @@ class TestOneLakeRelationTypeParsing(unittest.TestCase):
     def test_parse_relation_type_case_insensitive(self):
         """Type parsing should be case-insensitive"""
         config = self._get_config()
-        adapter = FabricSparkAdapter(config)
+        adapter = FabricSparkAdapter(config, self.mp_context)
 
         # lowercase
         information = "Type: managed\nProvider: delta\n"
@@ -737,7 +739,7 @@ class TestOneLakeRelationTypeParsing(unittest.TestCase):
     def test_parse_relation_type_legacy_view_detection(self):
         """Should fall back to legacy 'Type: VIEW' string detection"""
         config = self._get_config()
-        adapter = FabricSparkAdapter(config)
+        adapter = FabricSparkAdapter(config, self.mp_context)
         # Legacy format without regex match
         information = "Some info\nType: VIEW\nMore info"
         result = adapter._parse_relation_type(information)
@@ -746,7 +748,7 @@ class TestOneLakeRelationTypeParsing(unittest.TestCase):
     def test_parse_relation_type_no_type_defaults_to_table(self):
         """Missing type information should default to RelationType.Table"""
         config = self._get_config()
-        adapter = FabricSparkAdapter(config)
+        adapter = FabricSparkAdapter(config, self.mp_context)
         information = "Provider: delta\nLocation: /mnt/data"
         result = adapter._parse_relation_type(information)
         self.assertEqual(result, RelationType.Table)

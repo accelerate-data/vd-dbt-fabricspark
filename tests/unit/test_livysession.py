@@ -292,10 +292,17 @@ class TestFabricSessionReuseMode:
 
     @patch("dbt.adapters.fabricspark.livysession.get_headers")
     @patch("dbt.adapters.fabricspark.livysession.LivySession.create_session")
-    def test_fresh_mode_does_not_persist_session_file(self, mock_create, mock_headers):
-        """In non-reuse mode, session ID should NOT be written to file."""
+    def test_fresh_mode_persists_session_for_cross_process_sharing(self, mock_create, mock_headers):
+        """In non-reuse mode, session ID IS now written for cross-process sharing.
+
+        Even with reuse_session=False, we persist the session ID so parallel
+        dbt processes (e.g. sub-agent commands) reuse the same Spark session.
+        """
         mock_headers.return_value = {"Content-Type": "application/json"}
-        mock_create.return_value = None
+
+        def set_session_id(config):
+            LivySessionManager.livy_global_session.session_id = "fresh-42"
+        mock_create.side_effect = set_session_id
 
         with tempfile.TemporaryDirectory() as tmp:
             session_file = os.path.join(tmp, "session.txt")
@@ -305,7 +312,8 @@ class TestFabricSessionReuseMode:
 
             LivySessionManager._connect_fabric_fresh(credentials, {"name": "test"})
 
-            assert not os.path.exists(session_file), "Session file should not be created in non-reuse mode"
+            assert os.path.exists(session_file), "Session file should be created for cross-process sharing"
+            assert read_session_id_from_file(session_file) == "fresh-42"
 
     @patch("dbt.adapters.fabricspark.livysession.get_headers")
     @patch("dbt.adapters.fabricspark.livysession.LivySession.create_session")

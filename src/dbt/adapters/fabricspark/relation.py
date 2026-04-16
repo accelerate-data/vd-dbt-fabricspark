@@ -164,6 +164,9 @@ class FabricSparkRelation(BaseRelation):
         # Add workspace if present (four-part naming)
         if self.workspace:
             parts.append(self._render_part(self.workspace))
+            # Also add database for true four-part naming: workspace.database.schema.table
+            if self.include_policy.database and self.database:
+                parts.append(self._render_part(self.database))
         # Support database="workspace.lakehouse" when workspace is not set.
         elif self.include_policy.database and self.database and "." in self.database:
             db_parts = [part for part in self.database.split(".") if part]
@@ -253,7 +256,12 @@ class FabricSparkRelation(BaseRelation):
             include_policy = FabricSparkThreePartIncludePolicy()
         else:
             # Two-part naming: lakehouse.table
-            include_policy = FabricSparkIncludePolicy()
+            # Respect _schemas_enabled for database inclusion
+            include_policy = FabricSparkIncludePolicy(
+                database=cls._schemas_enabled,
+                schema=True,
+                identifier=True,
+            )
 
         kwargs["include_policy"] = include_policy
         kwargs["workspace"] = workspace
