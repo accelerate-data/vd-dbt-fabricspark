@@ -1,5 +1,5 @@
 [project]
-name = "dbt-fabricspark"
+name = "vd-dbt-fabricspark"
 dynamic = ["version"]
 description = "A Microsoft Fabric Spark adapter plugin for dbt"
 readme = "README.md"

@@ -75,7 +75,9 @@
 {% macro fabricspark__generate_schema_name(custom_schema_name, node) -%}
   {#-- For non-schema lakehouses, always use the lakehouse name as the schema
        (which maps to the single Spark database).
-       For schema-enabled lakehouses, use the default dbt behavior.
+       For schema-enabled lakehouses, use the custom_schema_name directly
+       (e.g. "elementary", "staging") — NOT the dbt default which prepends
+       target.schema (producing "dbo_elementary" which is wrong for Fabric).
        For cross-lakehouse writes (model sets database), use the custom_schema_name
        as-is since the target default schema belongs to the source lakehouse.
 
@@ -87,14 +89,13 @@
        reliable signal that the lakehouse has schemas enabled. --#}
   {% set _schema_enabled = adapter.is_lakehouse_schemas_enabled() or adapter.is_local_mode() or (target.schema is defined and target.lakehouse is defined and target.schema != target.lakehouse) %}
   {% if _schema_enabled %}
-    {% if node and node.config and node.config.get('database') %}
-      {% if custom_schema_name %}
-        {% do return(custom_schema_name) %}
-      {% else %}
-        {% do return(target.schema) %}
-      {% endif %}
+    {#-- Schema-enabled: use custom_schema_name directly (no prefix).
+         Fabric lakehouses have real schemas (dbo, elementary, staging, etc.)
+         so "elementary" should stay "elementary", not become "dbo_elementary". --#}
+    {% if custom_schema_name %}
+      {% do return(custom_schema_name | trim) %}
     {% else %}
-      {{ return(generate_schema_name_for_env(custom_schema_name, node)) }}
+      {% do return(target.schema) %}
     {% endif %}
   {% else %}
     {% do return(target.lakehouse) %}

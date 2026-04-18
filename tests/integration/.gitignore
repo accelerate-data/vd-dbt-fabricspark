@@ -1,0 +1,7 @@
+.venv/
+target/
+dbt_packages/
+prod-artifacts/
+logs/
+livy-session-id*
+.user.yml

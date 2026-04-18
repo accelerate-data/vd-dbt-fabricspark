@@ -1,0 +1,6 @@
+# Install the adapter in editable mode (from repo root)
+-e ../../
+
+# Elementary CLI (optional — for report generation)
+# elementary-data is the pip CLI; the dbt package is installed via dbt deps
+elementary-data>=0.22.0

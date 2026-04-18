@@ -1,0 +1,32 @@
+version: 2
+
+models:
+  - name: defer_base
+    description: "Base orders table for defer testing"
+    config:
+      schema: dbo
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+
+  - name: defer_agg
+    description: "Incremental daily aggregation for defer+clone testing"
+    config:
+      schema: dbo
+    columns:
+      - name: order_date
+        tests:
+          - unique
+          - not_null
+
+  - name: defer_summary
+    description: "View summary for defer testing"
+    config:
+      schema: dbo
+
+  - name: defer_customers
+    description: "Separate chain - should not be affected by defer_agg chain operations"
+    config:
+      schema: dbo
