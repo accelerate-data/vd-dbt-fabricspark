@@ -558,16 +558,20 @@ class LivySession:
                     self.is_new_session_required = False
                     return True
 
-            logger.debug(f"Session {session_id} in unexpected state: {current_state}")
+            logger.warning(
+                f"Session {session_id} in unexpected state: "
+                f"top={top_level_state}, livy={current_state}. "
+                f"Response: {json.dumps(res_json)[:500]}. Will create new session."
+            )
             self.session_id = None
             return False
 
         except requests.exceptions.RequestException as ex:
-            logger.debug(f"Error checking session {session_id}: {ex}")
+            logger.warning(f"Error checking session {session_id}: {ex}. Will create new session.")
             self.session_id = None
             return False
         except Exception as ex:
-            logger.debug(f"Unexpected error reusing session {session_id}: {ex}")
+            logger.warning(f"Unexpected error reusing session {session_id}: {ex}. Will create new session.")
             self.session_id = None
             return False
 
@@ -587,7 +591,10 @@ class LivySession:
                 if state == "idle":
                     return
                 elif state in ("dead", "error", "killed"):
-                    raise FailedToConnectError(f"Session {session_id} died while waiting")
+                    raise FailedToConnectError(
+                        f"Session {session_id} died while waiting. "
+                        f"State: {state}. Response: {json.dumps(res)[:500]}"
+                    )
                 else:
                     logger.debug(f"Session {session_id} is {state}, waiting...")
             else:
@@ -599,9 +606,14 @@ class LivySession:
                 if livy_state == "idle":
                     return
                 elif livy_state in ("dead", "error", "killed") or top_level_state in ("dead", "error", "killed"):
-                    raise FailedToConnectError(f"Session {session_id} died while waiting")
+                    error_info = res.get("errorInfo", [])
+                    err_detail = error_info[0].get("message", "") if error_info else ""
+                    raise FailedToConnectError(
+                        f"Session {session_id} died while waiting. "
+                        f"State: top={top_level_state}, livy={livy_state}. "
+                        f"{err_detail}. Response: {json.dumps(res)[:500]}"
+                    )
                 else:
-                    # Session still starting or in transition
                     logger.debug(f"Session {session_id} state: top={top_level_state}, livy={livy_state}, waiting...")
 
             time.sleep(self.credential.poll_wait)
@@ -631,32 +643,54 @@ class LivySession:
                 headers=get_headers(self.credential, False),
                 timeout=self.credential.http_timeout,
             )
-            if response.status_code == 200 or response.status_code == 201:
+
+            # Fabric returns 430 (or 429) when capacity has too many concurrent Spark sessions
+            if response.status_code in (429, 430):
+                raise FailedToConnectError(
+                    f"Fabric Spark rate limit (HTTP {response.status_code}): "
+                    f"too many concurrent Spark sessions on this capacity. "
+                    f"Cancel active jobs in Fabric Monitoring Hub, "
+                    f"use a larger capacity SKU, or try again later. "
+                    f"Tip: set reuse_session: true in profiles.yml to share sessions."
+                )
+
+            if response.status_code in (200, 201):
                 logger.debug("Initiated Livy Session...")
             response.raise_for_status()
+        except FailedToConnectError:
+            raise
         except requests.exceptions.ConnectionError as c_err:
             err_detail = c_err.response.json() if c_err.response else str(c_err)
-            raise Exception("Connection Error :", err_detail)
+            raise FailedToConnectError(f"Connection Error: {err_detail}")
         except requests.exceptions.HTTPError as h_err:
             err_detail = h_err.response.json() if h_err.response else str(h_err)
-            raise Exception("Http Error: ", err_detail)
+            raise FailedToConnectError(f"HTTP Error {h_err.response.status_code}: {err_detail}")
         except requests.exceptions.Timeout as t_err:
             err_detail = t_err.response.json() if t_err.response else str(t_err)
-            raise Exception("Timeout Error: ", err_detail)
-        except requests.exceptions.RequestException as a_err:
-            err_detail = a_err.response.json() if a_err.response else str(a_err)
-            raise Exception("Authorization Error: ", err_detail)
+            raise FailedToConnectError(f"Timeout Error: {err_detail}")
         except Exception as ex:
-            raise Exception(ex) from ex
+            raise FailedToConnectError(str(ex)) from ex
 
         if response is None:
-            raise Exception("Invalid response from Livy server")
+            raise FailedToConnectError(
+                "Session creation returned no response from Fabric Livy API. "
+                "Check endpoint URL, workspace ID, and lakehouse ID in profiles.yml."
+            )
 
         self.session_id = None
         try:
-            self.session_id = str(response.json()["id"])
-        except requests.exceptions.JSONDecodeError as json_err:
-            raise Exception("Json decode error to get session_id") from json_err
+            res_body = response.json()
+            session_id = res_body.get("id")
+            if session_id is None:
+                raise FailedToConnectError(
+                    f"Session creation response has no 'id' field. "
+                    f"Response: {json.dumps(res_body)[:500]}"
+                )
+            self.session_id = str(session_id)
+        except (requests.exceptions.JSONDecodeError, ValueError) as json_err:
+            raise FailedToConnectError(
+                f"Cannot parse session creation response: {response.text[:500]}"
+            ) from json_err
 
         # Wait for the session to start
         self.wait_for_session_start()
@@ -665,7 +699,18 @@ class LivySession:
         return self.session_id
 
     def wait_for_session_start(self) -> None:
-        """Wait for the Livy session to reach the 'idle' state."""
+        """Wait for the Livy session to reach the 'idle' state.
+
+        Fabric's SessionResponse has three state fields (all optional per swagger):
+          - state: top-level Livy state (starting/idle/dead/error/...)
+          - livyInfo.currentState: Livy-side state (mirrors top-level, may lag)
+          - fabricSessionStateInfo.state: Fabric acquisition state
+            (queued/acquiringSession/error/cancelled/...)
+
+        During early session acquisition, only fabricSessionStateInfo is populated.
+        livyInfo appears once the Spark driver is provisioned.
+        On non-2xx responses, body is ErrorResponse (no state fields at all).
+        """
         deadline = time.time() + self.credential.session_start_timeout
         while True:
             if time.time() > deadline:
@@ -673,46 +718,86 @@ class LivySession:
                     f"Timeout ({self.credential.session_start_timeout}s) waiting for session "
                     f"{self.session_id} to start. Increase `session_start_timeout` in profiles.yml."
                 )
-            res = requests.get(
+
+            http_res = requests.get(
                 self.connect_url + "/sessions/" + self.session_id,
                 headers=get_headers(self.credential, False),
                 timeout=self.credential.http_timeout,
-            ).json()
+            )
 
-            # Local Livy uses "state" directly, Fabric uses "livyInfo.currentState"
+            # Non-2xx: body is ErrorResponse (errorCode + message), not SessionResponse.
+            # Don't try to read state/livyInfo from it.
+            if http_res.status_code >= 400:
+                try:
+                    err_body = http_res.json()
+                    err_code = err_body.get("errorCode", "")
+                    err_msg = err_body.get("message", "")
+                except Exception:
+                    err_code = f"HTTP {http_res.status_code}"
+                    err_msg = http_res.text[:500]
+                raise FailedToConnectError(
+                    f"Failed to poll session {self.session_id}: "
+                    f"{err_code} — {err_msg}"
+                )
+
+            res = http_res.json()
+
+            # Local Livy uses "state" directly
             if self.is_local_mode:
                 state = res.get("state", "")
                 if state in ("starting", "not_started"):
                     time.sleep(self.credential.poll_wait)
                 elif state == "idle":
-                    logger.debug(f"New livy session id is: {self.session_id}, {res}")
+                    logger.debug(f"New livy session id is: {self.session_id}")
                     self.is_new_session_required = False
                     break
-                elif state in ("dead", "error"):
-                    logger.error("ERROR, cannot create a livy session")
-                    raise FailedToConnectError("failed to connect")
+                elif state in ("dead", "error", "killed"):
+                    raise FailedToConnectError(
+                        f"Session {self.session_id} died during startup. "
+                        f"State: {state}. Response: {json.dumps(res)[:500]}"
+                    )
+                else:
+                    logger.debug(f"Session {self.session_id} state: {state}, waiting...")
+                    time.sleep(self.credential.poll_wait)
             else:
-                # Fabric Livy: check top-level state first
-                # When session is starting, "livyInfo" may not exist yet
-                top_level_state = res.get("state", "")
+                # Fabric: three state levels (all optional per swagger spec)
+                top_state = res.get("state", "")
                 livy_info = res.get("livyInfo", {})
                 livy_state = livy_info.get("currentState", "")
+                fabric_info = res.get("fabricSessionStateInfo", {})
+                fabric_state = fabric_info.get("state", "")
 
-                if top_level_state in ("starting", "not_started"):
-                    # Session still starting, continue polling
-                    logger.debug(f"Session {self.session_id} is {top_level_state}, waiting...")
-                    time.sleep(self.credential.poll_wait)
-                elif livy_state == "idle":
-                    logger.debug(f"New livy session id is: {self.session_id}, {res}")
+                # Fabric-side acquisition failure (earliest signal)
+                if fabric_state in ("error", "cancelled"):
+                    raise FailedToConnectError(
+                        f"Fabric failed to acquire Spark session {self.session_id}. "
+                        f"fabricSessionStateInfo.state={fabric_state}. "
+                        f"Response: {json.dumps(res)[:1000]}"
+                    )
+
+                # Terminal Livy states
+                if top_state in ("dead", "error", "killed", "not_submitted") or \
+                   livy_state in ("dead", "error", "killed"):
+                    error_info = res.get("errorInfo", [])
+                    err_detail = error_info[0].get("message", "") if error_info else ""
+                    raise FailedToConnectError(
+                        f"Spark session {self.session_id} failed to start. "
+                        f"state={top_state}, livy={livy_state}, fabric={fabric_state}. "
+                        f"{err_detail}. Response: {json.dumps(res)[:1000]}"
+                    )
+
+                # Session is ready
+                if livy_state == "idle" or top_state == "idle":
+                    logger.debug(f"Livy session {self.session_id} is idle and ready")
                     self.is_new_session_required = False
                     break
-                elif livy_state == "dead" or top_level_state == "dead":
-                    logger.error("ERROR, cannot create a livy session")
-                    raise FailedToConnectError("failed to connect")
-                else:
-                    # Unknown state, keep waiting (could be transitioning)
-                    logger.debug(f"Session {self.session_id} in state: top={top_level_state}, livy={livy_state}, waiting...")
-                    time.sleep(self.credential.poll_wait)
+
+                # Still starting — log all three states for debuggability
+                logger.debug(
+                    f"Session {self.session_id} starting: "
+                    f"state={top_state}, livy={livy_state}, fabric={fabric_state}"
+                )
+                time.sleep(self.credential.poll_wait)
 
     def delete_session(self) -> None:
         try:
@@ -891,7 +976,12 @@ class LivyCursor:
 
     def _getLivyResult(self, res_obj) -> Response:
         json_res = res_obj.json()
-        statement_id = repr(json_res["id"])
+        stmt_id = json_res.get("id")
+        if stmt_id is None:
+            raise DbtDatabaseError(
+                f"Statement submit response has no 'id'. Response: {json.dumps(json_res)[:500]}"
+            )
+        statement_id = repr(stmt_id)
         url = self.connect_url + "/sessions/" + self.session_id + "/statements/" + statement_id
         deadline = time.time() + self.credential.statement_timeout
         consecutive_failures = 0
@@ -969,25 +1059,31 @@ class LivyCursor:
         for attempt in range(1 + retries):
             res = self._getLivyResult(self._submitLivyCode(self._getLivySQL(sql)))
             logger.debug(res)
-            if res["output"]["status"] == "ok":
+
+            output = res.get("output")
+            if output is None:
+                raise DbtDatabaseError(
+                    f"Statement response has no 'output' field. "
+                    f"Full response: {json.dumps(res)[:1000]}"
+                )
+            output_status = output.get("status", "")
+
+            if output_status == "ok":
+                output_data = output.get("data", {})
                 # Local and Fabric Livy have different output structures
                 if self.is_local_mode:
-                    # Local Livy returns data in "text/plain" or "application/json" format
-                    output_data = res["output"].get("data", {})
                     if "application/json" in output_data:
                         values = output_data["application/json"]
                         if isinstance(values, dict) and "data" in values:
                             self._rows = values["data"]
                             self._schema = values.get("schema", {}).get("fields", [])
                         elif isinstance(values, list):
-                            # Direct list of results
                             self._rows = values
                             self._schema = []
                         else:
                             self._rows = []
                             self._schema = []
                     elif "text/plain" in output_data:
-                        # Text output - parse if possible
                         self._rows = []
                         self._schema = []
                     else:
@@ -995,16 +1091,20 @@ class LivyCursor:
                         self._schema = []
                 else:
                     # Fabric Livy format
-                    values = res["output"]["data"]["application/json"]
-                    if len(values) >= 1:
-                        self._rows = values["data"]  # values[0]['values']
-                        self._schema = values["schema"]["fields"]  # values[0]['schema']
+                    values = output_data.get("application/json", {})
+                    if values and isinstance(values, dict):
+                        self._rows = values.get("data", [])
+                        self._schema = values.get("schema", {}).get("fields", [])
                     else:
                         self._rows = []
                         self._schema = []
                 return
 
-            last_error = res["output"]["evalue"]
+            last_error = output.get("evalue") or output.get("traceback") or (
+                f"Unknown error (status={output_status}). "
+                f"Full output: {json.dumps(output)[:500]}. "
+                f"Full response: {json.dumps(res)[:500]}"
+            )
             # Retry on timeout errors (e.g. Spark cold-start TimeoutException)
             if "timeout" in last_error.lower() and attempt < retries:
                 logger.warning(

@@ -67,10 +67,50 @@ database (`sampledata.salesforce`), causing `get_relation()` to return None.
 custom schema names (e.g. `dbo_elementary` instead of `elementary`). Fabric lakehouses have
 real schemas so the custom name should be used directly.
 
-### 7. Integration test suite
-**Files**: `tests/integration/` (dbt project with table/view/incremental/elementary tests)
+### 7. Fabric API robustness (defensive response parsing)
+**Files**: `livysession.py` (`create_session`, `wait_for_session_start`, `execute`)
+**Status**: Active — fixes real production bugs
+**Why**: Fabric's Livy API has a fragile contract. Per the official Swagger spec
+(`microsoft/fabric-samples/.../Livy-API-swagger/swagger.yaml`):
+- **All fields in `SessionResponse` are optional** — `state`, `livyInfo`, `id` are
+  NOT required. Any client doing `res["state"]` violates the spec.
+- **`state` values are open-ended strings**, not an enforced enum. New values can
+  appear without spec changes.
+- **Error responses (4xx/5xx) use a different schema** (`ErrorResponse` with
+  `errorCode` + `message`) — no `state`, no `livyInfo`, no `id`.
+- **HTTP 430** (non-standard) returned by Fabric for rate limiting ("too many
+  concurrent Spark sessions"). Not in any HTTP spec but Fabric uses it.
+
+**What we hardened** (upstream code had `res["state"]` → KeyError):
+1. **Zero direct dict access on API responses** — all fields use `.get()` with
+   fallback. Every missing field raises an error with the full response dumped.
+2. **HTTP status check before parsing** — `wait_for_session_start` checks
+   `status_code >= 400` and parses as `ErrorResponse` (not `SessionResponse`).
+3. **Three-level state checking** — `state` (top-level) + `livyInfo.currentState`
+   (Livy-side) + `fabricSessionStateInfo.state` (Fabric acquisition-side, earliest
+   signal for provisioning failures like `error`/`cancelled`).
+4. **HTTP 429/430 handling** in `create_session` — clear error message instead of
+   cryptic `KeyError('state')`.
+5. **`errorInfo` extraction** — surfaces Fabric's error code and message (e.g.
+   `LIVY_JOB_TIMED_OUT`) in the error instead of generic "failed to connect".
+
+**Real bugs this fixes**:
+- User got `failed to connect: 'state'` — Fabric returned 430 (rate limit), old code
+  tried `res["state"]` on the `ErrorResponse` body → KeyError.
+- Session polling looped silently for 10 minutes then timed out — `fabricSessionStateInfo`
+  showed `error` but code only checked `state` and `livyInfo`.
+- Statement execution failed with `KeyError: 'output'` — intermittent Fabric API response
+  missing the `output` field.
+
+### 8. Integration test suite
+**Files**: `tests/integration/` (dbt project with table/view/incremental/elementary/defer tests)
 **Status**: Active
 **Why**: End-to-end smoke test against real Fabric workspace. Not in upstream.
+Includes:
+- `run_integration_test.sh` — table/view/incremental + elementary (26 steps)
+- `run_defer_test.sh` — defer + clone + state:modified (26 steps, all passing)
+- dbt unit tests (7 tests for SQL logic)
+- Verification macros + compiled SQL checks
 
 ---
 
