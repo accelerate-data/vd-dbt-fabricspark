@@ -1,7 +1,0 @@
-packages:
-  - package: elementary-data/elementary
-    version: 0.22.1
-  - package: dbt-labs/dbt_utils
-    version: 1.1.1
-  - local: /home/pdip/Projects/vd-dbt-elementary-fabricspark
-sha1_hash: 877c3578a30a55c3a88d484bcc02769281ecf419

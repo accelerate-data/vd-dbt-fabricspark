@@ -63,9 +63,9 @@ database (`sampledata.salesforce`), causing `get_relation()` to return None.
 **Files**: `livysession.py` (`get_vdstudio_oauth_access_token`, `get_env_access_token`)
 **Status**: Active
 **Why**: Support for vd-studio local OAuth and environment variable token injection.
-- `authentication: vdstudio_oauth` — gets token from local vd-studio OAuth endpoint
-- `authentication: env_oauth_access_token` — reads token from `FABRIC_LAKEHOUSE_ACCESS_TOKEN` env var
-- `authentication: fabric_notebook` — gets token from `notebookutils` (Fabric runtime)
+- `authentication: vdstudio_oauth` — gets token from local vd-studio OAuth endpoint (FORK-ONLY)
+- `authentication: env_oauth_access_token` — reads token from `FABRIC_LAKEHOUSE_ACCESS_TOKEN` env var (FORK-ONLY)
+- ~~`authentication: fabric_notebook`~~ — **upstream has this now** (v1.9.6); no longer fork-unique
 
 ### 6. Elementary schema fix (generate_schema_name)
 **Files**: `macros/adapters/schema.sql` (`fabricspark__generate_schema_name`)
@@ -109,15 +109,11 @@ real schemas so the custom name should be used directly.
 - Statement execution failed with `KeyError: 'output'` — intermittent Fabric API response
   missing the `output` field.
 
-### 8. Integration test suite
-**Files**: `tests/integration/` (dbt project with table/view/incremental/elementary/defer tests)
-**Status**: Active
-**Why**: End-to-end smoke test against real Fabric workspace. Not in upstream.
-Includes:
-- `run_integration_test.sh` — table/view/incremental + elementary (26 steps)
-- `run_defer_test.sh` — defer + clone + state:modified (26 steps, all passing)
-- dbt unit tests (7 tests for SQL logic)
-- Verification macros + compiled SQL checks
+### 8. Integration test suite — MOVED OUT
+**Status**: Extracted to [`accelerate-data/vd-fabric-adapter-e2e`](https://github.com/pradipsodha-acceleratedata/vd-fabric-adapter-e2e) on 2026-05-01.
+**Was**: `tests/integration/` in the fork — dbt project with table/view/incremental/elementary/defer tests, run scripts, verification macros.
+**Why moved**: per the fork-thinning plan (F8), end-to-end tests don't belong in the adapter package — they need a real Fabric workspace and ship outside the wheel anyway. The new repo also hosts the `sample-project` (formerly `dev-dbt-kuruma-project`) for agent demos.
+**What stayed in the fork**: `tests/unit/` (232 tests) — those exercise adapter code directly.
 
 ---
 
