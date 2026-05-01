@@ -79,7 +79,9 @@ class TestRequestWithRetry:
         rate_limit_resp = MagicMock()
         rate_limit_resp.status_code = 429
         rate_limit_resp.headers = {"Retry-After": "1"}
-        rate_limit_resp.json.return_value = {"error": {"code": "TooManyRequests", "message": "slow down"}}
+        rate_limit_resp.json.return_value = {
+            "error": {"code": "TooManyRequests", "message": "slow down"}
+        }
         rate_limit_resp.text = "slow down"
 
         ok_resp = MagicMock()
@@ -211,16 +213,32 @@ class TestPollJobInstanceUntilComplete:
 
     @patch("dbt.adapters.fabricspark.mlv_api.time.sleep")
     @patch("dbt.adapters.fabricspark.mlv_api.get_job_instance")
-    def test_raises_on_cancelled(self, mock_get, mock_sleep, mock_credentials):
-        mock_get.return_value = {"status": "Cancelled", "failureReason": None}
-        with pytest.raises(MLVApiError, match="Cancelled"):
-            poll_job_instance_until_complete(mock_credentials, "job-1")
+    def test_treats_cancelled_as_success(self, mock_get, mock_sleep, mock_credentials):
+        """``Cancelled``/``Deduped`` indicate the refresh was superseded by a
+        concurrent job — the lineage is (or will be) refreshed by that job, so
+        we surface this as a successful no-op rather than raising.
+        """
+        job = {"status": "Cancelled", "failureReason": None}
+        mock_get.return_value = job
+        result = poll_job_instance_until_complete(mock_credentials, "job-1")
+        assert result == job
 
     @patch("dbt.adapters.fabricspark.mlv_api.time.sleep")
     @patch("dbt.adapters.fabricspark.mlv_api.get_job_instance")
-    def test_raises_on_timeout(self, mock_get, mock_sleep, mock_credentials):
+    def test_treats_deduped_as_success(self, mock_get, mock_sleep, mock_credentials):
+        job = {"status": "Deduped", "failureReason": None}
+        mock_get.return_value = job
+        result = poll_job_instance_until_complete(mock_credentials, "job-1")
+        assert result == job
+
+    @patch("dbt.adapters.fabricspark.mlv_api.time.time")
+    @patch("dbt.adapters.fabricspark.mlv_api.time.sleep")
+    @patch("dbt.adapters.fabricspark.mlv_api.get_job_instance")
+    def test_raises_on_timeout(self, mock_get, mock_sleep, mock_time, mock_credentials):
         mock_credentials.statement_timeout = 2
         mock_credentials.poll_statement_wait = 1
+        # Provide enough values for repeated time.time() calls in setup + poll loop
+        mock_time.side_effect = [100.0] * 5 + [103.0] * 5
         mock_get.return_value = {"status": "InProgress", "failureReason": None}
         with pytest.raises(MLVApiError, match="timed out"):
             poll_job_instance_until_complete(mock_credentials, "job-1")
@@ -243,7 +261,10 @@ class TestRunOnDemandRefresh:
         result = run_on_demand_refresh(mock_credentials)
 
         mock_request.assert_called_once()
-        mock_poll.assert_called_once_with(mock_credentials, "job-123", None)
+        mock_poll.assert_called_once()
+        call_args = mock_poll.call_args
+        assert call_args[0] == (mock_credentials, "job-123", None)
+        assert "deadline" in call_args[1]
         assert result["status"] == "Completed"
 
     @patch("dbt.adapters.fabricspark.mlv_api.get_headers")
@@ -273,9 +294,7 @@ class TestListSchedules:
     def test_returns_schedules(self, mock_request, mock_headers, mock_credentials):
         mock_headers.return_value = {"Authorization": "Bearer token"}
         mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "value": [{"id": "sched-1", "enabled": True}]
-        }
+        mock_response.json.return_value = {"value": [{"id": "sched-1", "enabled": True}]}
         mock_request.return_value = mock_response
 
         result = list_schedules(mock_credentials)
@@ -387,9 +406,7 @@ class TestCreateOrUpdateSchedule:
         config = {"enabled": True, "configuration": {"type": "Cron", "interval": 30}}
         result = create_or_update_schedule(mock_credentials, config)
 
-        mock_update.assert_called_once_with(
-            mock_credentials, "sched-existing", config, None
-        )
+        mock_update.assert_called_once_with(mock_credentials, "sched-existing", config, None)
         assert result["id"] == "sched-existing"
 
     @patch("dbt.adapters.fabricspark.mlv_api.create_schedule")
@@ -429,9 +446,7 @@ class TestResolveLakehouseId:
     def test_case_insensitive(self, mock_request, mock_headers, mock_credentials):
         mock_headers.return_value = {"Authorization": "Bearer token"}
         mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "value": [{"id": "lh-gold-id", "displayName": "Gold"}]
-        }
+        mock_response.json.return_value = {"value": [{"id": "lh-gold-id", "displayName": "Gold"}]}
         mock_request.return_value = mock_response
 
         result = resolve_lakehouse_id(mock_credentials, "gold")
@@ -455,9 +470,7 @@ class TestResolveLakehouseId:
     def test_uses_cache(self, mock_request, mock_headers, mock_credentials):
         mock_headers.return_value = {"Authorization": "Bearer token"}
         mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "value": [{"id": "lh-gold-id", "displayName": "gold"}]
-        }
+        mock_response.json.return_value = {"value": [{"id": "lh-gold-id", "displayName": "gold"}]}
         mock_request.return_value = mock_response
 
         # First call populates cache

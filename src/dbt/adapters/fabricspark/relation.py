@@ -20,10 +20,14 @@ class FabricSparkQuotePolicy(Policy):
     """Quote policy for Fabric Spark relations.
 
     OneLake uses backtick quoting for identifiers with special characters.
-    By default, quoting is disabled for cleaner SQL generation.
+
+    Note: ``database`` is quoted (True) so that dbt preserves original casing
+    through ``_make_match_kwargs``; otherwise mixed-case lakehouse names like
+    ``'DBTTest'`` get lowered to ``'dbttest'`` and trigger ApproximateMatchError.
+    (Upstream v1.9.6 fix.)
     """
 
-    database: bool = False
+    database: bool = True
     schema: bool = False
     identifier: bool = False
 
@@ -99,6 +103,9 @@ class FabricSparkRelation(BaseRelation):
     # Macros can still override per-relation via .include(database=false, schema=false)
     # for temporary views which require unqualified identifiers.
     _schemas_enabled: ClassVar[bool] = False
+    # Upstream v1.9.6: optional prefix prepended to all identifiers (skips CTEs).
+    # Set via the `identifier_prefix` credential.
+    _identifier_prefix: ClassVar[str] = ""
 
     quote_policy: Policy = field(default_factory=lambda: FabricSparkQuotePolicy())
     include_policy: Policy = field(
@@ -110,8 +117,9 @@ class FabricSparkRelation(BaseRelation):
     )
     quote_character: str = "`"
     is_delta: Optional[bool] = None
+    # TODO: make this a dict everywhere
     information: Optional[str] = None
-    # Four-part naming: workspace for cross-workspace queries
+    # Fork: Four-part naming — workspace for cross-workspace queries
     workspace: Optional[str] = None
 
     def incorporate(self, **kwargs):
@@ -120,7 +128,7 @@ class FabricSparkRelation(BaseRelation):
         # dbt/jinja may pass an Undefined sentinel (or "Undefined" as a string)
         if t == "Undefined" or getattr(t, "__class__", None).__name__ == "Undefined":
             kwargs = dict(kwargs)
-            kwargs.pop("type", None)  # or: kwargs["type"] = None
+            kwargs.pop("type", None)
 
         return super().incorporate(**kwargs)
 
@@ -132,9 +140,7 @@ class FabricSparkRelation(BaseRelation):
             if not isinstance(type_val, RelationType):
                 type_str = str(type_val)
                 if type_str not in _VALID_RELATION_TYPES:
-                    logger.debug(
-                        f"Replacing invalid relation type '{type_str}' with None"
-                    )
+                    logger.debug(f"Replacing invalid relation type '{type_str}' with None")
                     data = dict(data)
                     data["type"] = None
         return super().from_dict(data)
@@ -143,49 +149,50 @@ class FabricSparkRelation(BaseRelation):
         # Validation is relaxed to allow flexible naming patterns
         pass
 
-    def _render_part(self, part: Optional[str]) -> str:
+    def _render_part(self, part: Optional[str], quote: bool = False) -> str:
         """Render a single part of the relation name with optional quoting."""
         if part is None:
             return ""
-        if self.quote_policy.identifier:
+        if quote:
             return f"{self.quote_character}{part}{self.quote_character}"
         return part
 
     def render(self) -> str:
         """Render the relation as a SQL identifier string.
 
+        Respects per-part quote policy (``database``, ``schema``, ``identifier``).
+
         Supports:
         - Two-part: lakehouse.table (schema.identifier)
         - Three-part: lakehouse.schema.table (database.schema.identifier)
-        - Four-part: workspace.lakehouse.schema.table (workspace.database.schema.identifier)
+        - Four-part: workspace.lakehouse.schema.table
         """
         parts = []
+        q_db = self.quote_policy.database
+        q_schema = self.quote_policy.schema
+        q_id = self.quote_policy.identifier
 
-        # Add workspace if present (four-part naming)
+        # Add workspace if present (four-part naming) — quote like database
         if self.workspace:
-            parts.append(self._render_part(self.workspace))
-            # Also add database for true four-part naming: workspace.database.schema.table
+            parts.append(self._render_part(self.workspace, quote=q_db))
             if self.include_policy.database and self.database:
-                parts.append(self._render_part(self.database))
+                parts.append(self._render_part(self.database, quote=q_db))
         # Support database="workspace.lakehouse" when workspace is not set.
         elif self.include_policy.database and self.database and "." in self.database:
-            db_parts = [part for part in self.database.split(".") if part]
+            db_parts = [p for p in self.database.split(".") if p]
             if len(db_parts) == 2:
-                for part in db_parts:
-                    parts.append(self._render_part(part))
+                for p in db_parts:
+                    parts.append(self._render_part(p, quote=q_db))
             else:
-                parts.append(self._render_part(self.database))
-        # Add database if included (three/four-part naming)
+                parts.append(self._render_part(self.database, quote=q_db))
         elif self.include_policy.database and self.database:
-            parts.append(self._render_part(self.database))
+            parts.append(self._render_part(self.database, quote=q_db))
 
-        # Add schema if included
         if self.include_policy.schema and self.schema:
-            parts.append(self._render_part(self.schema))
+            parts.append(self._render_part(self.schema, quote=q_schema))
 
-        # Add identifier if included
         if self.include_policy.identifier and self.identifier:
-            parts.append(self._render_part(self.identifier))
+            parts.append(self._render_part(self.identifier, quote=q_id))
 
         return ".".join(parts)
 
@@ -236,6 +243,10 @@ class FabricSparkRelation(BaseRelation):
     ) -> "FabricSparkRelation":
         """Create a new FabricSparkRelation with support for four-part naming.
 
+        Combines:
+        - Fork: workspace-aware include policy selection (2/3/4-part)
+        - Upstream v1.9.6: ``_identifier_prefix`` auto-prepend (skips CTEs)
+
         Args:
             database: Lakehouse name (for three/four-part naming)
             schema: Schema name (or lakehouse name for two-part naming)
@@ -247,7 +258,19 @@ class FabricSparkRelation(BaseRelation):
         Returns:
             A new FabricSparkRelation instance
         """
-        # Determine the appropriate include policy based on naming pattern
+        # Upstream v1.9.6: identifier prefix logic
+        skip_prefix = kwargs.pop("_skip_prefix", False)
+        prefix = cls._identifier_prefix
+        if prefix and identifier and not skip_prefix:
+            # Never prefix CTE identifiers — ephemeral models are inlined as
+            # WITH clauses and must keep their dbt-generated __dbt__cte__ name.
+            is_cte = (type == RelationType.CTE) or (
+                isinstance(identifier, str) and "__dbt__cte__" in identifier
+            )
+            if not is_cte and not identifier.startswith(prefix):
+                identifier = f"{prefix}{identifier}"
+
+        # Fork: determine the appropriate include policy based on naming pattern
         if workspace:
             # Four-part naming: workspace.lakehouse.schema.table
             include_policy = FabricSparkFourPartIncludePolicy()

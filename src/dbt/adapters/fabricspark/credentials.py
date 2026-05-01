@@ -38,7 +38,7 @@ class FabricSparkCredentials(Credentials):
     livy_mode: LivyMode = "fabric"  # "fabric" or "local"
     workspaceid: Optional[str] = None
     workspace_name: Optional[str] = (
-        None  # Friendly name for current workspace (for four-part refs)
+        None  # Fork: Friendly name for current workspace (for four-part refs)
     )
     # database is internal — always derived from lakehouse name.
     # Not a user input. init=False excludes it from deserialization.
@@ -59,20 +59,23 @@ class FabricSparkCredentials(Credentials):
     # Auto-detected at connection time via Fabric REST API; not user-configurable.
     # init=False ensures this is never populated from profile YAML.
     lakehouse_schemas_enabled: bool = field(default=False, init=False)
+    identifier_prefix: Optional[str] = ""
     accessToken: Optional[str] = None
     spark_config: Dict[str, Any] = field(default_factory=dict)
     environmentId: Optional[str] = None
     session_id_file: Optional[str] = None
     reuse_session: bool = False  # When True, Fabric sessions are kept alive and reused across runs
     session_idle_timeout: str = "30m"  # Livy session idle timeout (e.g. "30m", "1h")
-    vdstudio_oauth_endpoint_url: Optional[str] = None
+    vdstudio_oauth_endpoint_url: Optional[str] = None  # Fork: vdstudio OAuth token endpoint
 
     # Livy session stability settings
     http_timeout: int = 120  # seconds for each HTTP request to Fabric API
     session_start_timeout: int = 600  # max seconds to wait for session start (10 min)
-    statement_timeout: int = 3600  # max seconds to wait for a statement result (1 hour)
+    statement_timeout: int = (
+        43200  # max seconds to wait for a statement result (12 hours); 0 = no timeout
+    )
     poll_wait: int = 10  # seconds between polls for session start
-    poll_statement_wait: int = 5  # seconds between polls for statement result
+    poll_statement_wait: float = 0.5  # seconds between polls for statement result
 
     def __repr__(self) -> str:
         """Mask sensitive fields in repr to prevent credential leakage in logs/tracebacks."""
@@ -149,14 +152,13 @@ class FabricSparkCredentials(Credentials):
         elif self.is_local_mode:
             self.database = "default"
 
-        # If workspace_name is set, compose database as "workspace.lakehouse"
+        # Fork: If workspace_name is set, compose database as "workspace.lakehouse"
         # so relations render as four-part names: workspace.lakehouse.schema.table
+        # (used for cross-workspace --defer)
         if self.workspace_name and self.database and "." not in self.database:
             self.database = f"{self.workspace_name}.{self.database}"
             self.lakehouse = self.database
-            logger.debug(
-                f"Workspace-qualified database: {self.database}"
-            )
+            logger.debug(f"Workspace-qualified database: {self.database}")
 
         # Security validations (Fabric mode only)
         if not self.is_local_mode:
@@ -185,14 +187,22 @@ class FabricSparkCredentials(Credentials):
         logger.debug(f"Lakehouse schemas enabled: {self.lakehouse_schemas_enabled}")
 
         if self.lakehouse_schemas_enabled:
-            if self.schema is not None and self.lakehouse is not None and self.schema == self.lakehouse:
+            if (
+                self.schema is not None
+                and self.lakehouse is not None
+                and self.schema == self.lakehouse
+            ):
                 raise DbtRuntimeError(
                     f"Lakehouse '{self.lakehouse}' has schemas enabled. "
                     f"Please set `schema` in profiles.yml to a schema name other than "
                     f"the lakehouse name (e.g. 'dbo')."
                 )
         else:
-            if self.schema is not None and self.lakehouse is not None and self.schema != self.lakehouse:
+            if (
+                self.schema is not None
+                and self.lakehouse is not None
+                and self.schema != self.lakehouse
+            ):
                 logger.debug(
                     f"Non-schema lakehouse: overriding schema '{self.schema}' "
                     f"to lakehouse name '{self.lakehouse}'"
@@ -216,14 +226,10 @@ class FabricSparkCredentials(Credentials):
 
         parsed = urlparse(self.endpoint)
         if parsed.scheme != "https":
-            raise DbtRuntimeError(
-                f"endpoint must use HTTPS, got: {self.endpoint}"
-            )
+            raise DbtRuntimeError(f"endpoint must use HTTPS, got: {self.endpoint}")
 
         hostname = parsed.hostname or ""
-        is_known_domain = any(
-            re.search(pattern, hostname) for pattern in _ALLOWED_FABRIC_DOMAINS
-        )
+        is_known_domain = any(re.search(pattern, hostname) for pattern in _ALLOWED_FABRIC_DOMAINS)
         if not is_known_domain:
             logger.warning(
                 f"Security warning: endpoint '{self.endpoint}' does not match any known "
@@ -242,6 +248,7 @@ class FabricSparkCredentials(Credentials):
 
     def _connection_keys(self) -> Tuple[str, ...]:
         # Intentionally excludes client_secret, accessToken, tenant_id
+        # Fork: includes workspace_name for cross-workspace defer
         return (
             "workspaceid",
             "workspace_name",
@@ -252,7 +259,7 @@ class FabricSparkCredentials(Credentials):
         )
 
     def is_current_workspace(self, workspace_name: str) -> bool:
-        """Check if a workspace name refers to the current workspace.
+        """Fork: Check if a workspace name refers to the current workspace.
 
         Args:
             workspace_name: The friendly name or ID to check

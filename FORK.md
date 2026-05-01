@@ -3,8 +3,15 @@
 Tracks all features added by the accelerate-data fork that are NOT in
 upstream microsoft/dbt-fabricspark. Helps with future upstream merges.
 
-**Upstream**: microsoft/dbt-fabricspark (v1.9.5 as of 2026-04-17)
-**Fork**: accelerate-data/vd-dbt-fabricspark (v1.9.14)
+**Upstream**: microsoft/dbt-fabricspark (v1.9.6 as of 2026-04-25)
+**Fork**: accelerate-data/vd-dbt-fabricspark (v1.9.16)
+
+## Recent Sync History
+
+| Fork ver | Upstream | Date | Spec |
+|---|---|---|---|
+| 1.9.14 | v1.9.5 | 2026-04-17 | spec/fork-merge-changelog.md |
+| 1.9.16 | v1.9.6 | 2026-04-25 | spec/v196-merge-analysis.md |
 
 ---
 
@@ -147,7 +154,7 @@ dev:
 
 ---
 
-## Upstream Features Gained (v1.9.5 merge)
+## Upstream Features Gained (v1.9.5 merge — 2026-04-17)
 
 These came from upstream and are NOT fork-specific:
 - Materialized Lake View (MLV) support
@@ -159,3 +166,52 @@ These came from upstream and are NOT fork-specific:
 - OneLake type parsing (MANAGED/EXTERNAL/MLV)
 - Exponential backoff retry
 - CI/CD modernization
+
+## Upstream Features Gained (v1.9.6 merge — 2026-04-25)
+
+Theme: **Resilience hardening + new identifier_prefix feature**.
+
+### Resilience improvements
+
+- `_parse_retry_after()` helper — proper Retry-After header parsing for 429s
+- POLL_TIMEOUT 600s → 1800s (sessions have 30 min to start under contention)
+- HTTP 429 retry on session creation POST (5 retries with exponential backoff + jitter)
+- Shard staggering (5s × shard index) for concurrent session creation
+- 404 retry on session creation POST (Livy endpoint warmup)
+- `retry_all` honored for statement execution + new retryable keywords
+- MLV API hardened against 429 throttling
+- Network exception handling (SSLError/ConnectionError/Timeout) in submit + poll
+- HTTP 404 retry-with-backoff for just-submitted statements
+- Fabric API timeout 30s → 120s (avoids transient ReadTimeoutError)
+- `connect_retries` default 1 → 5 (kept upstream default)
+- `statement_timeout` default 3600s → 43200s (12h, supports long-running models)
+- `poll_statement_wait` default `5` → `0.5` (faster MLV polling)
+
+### Bug fixes
+
+- `_fix_binding`: single-quote escaping in seed values
+- `FabricSparkQuotePolicy.database = True` — fixes mixed-case lakehouse `ApproximateMatchError`
+- `MATERIALIZED_LAKE_VIEW` type string match in `_build_spark_relation_list`
+- `drop_relation` macro handles `materialized_view` type
+- `ensure_database_exists` macro guard for schema-enabled
+- Seed materialization drops stale catalog entry first (fixes DELTA_METADATA_ABSENT)
+- Snapshot uses `model.database` for cross-lakehouse writes
+
+### New features
+
+- `identifier_prefix` config field — auto-prepend prefix to all identifiers (skips CTEs)
+- `_identifier_prefix` ClassVar on `FabricSparkRelation`
+- `_skip_prefix` kwarg in `create()` for opt-out
+
+### Infrastructure
+
+- `azure-cli` moved to optional `[cli]` extra (lighter install)
+
+## Breaking Changes from v1.9.14 → v1.9.16
+
+| v1.9.14 | v1.9.16 | Action |
+|---|---|---|
+| `quote_policy.database = False` | `quote_policy.database = True` | Database identifiers now backtick-quoted in rendered SQL |
+| `statement_timeout: int = 3600` | `statement_timeout: int = 43200` | 12h default supports long-running models |
+| `poll_statement_wait: int = 5` | `poll_statement_wait: float = 0.5` | Faster polling, type changed to float |
+| `azure-cli` always installed | `azure-cli` optional `[cli]` extra | Users needing CLI auth: `pip install vd-dbt-fabricspark[cli]` |

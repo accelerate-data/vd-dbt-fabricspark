@@ -33,24 +33,30 @@ def test_two_part_relation_render() -> None:
 
 
 def test_three_part_relation_render() -> None:
-    """Three-part naming: database.schema.identifier → 'gold.dbo.dim_customers'."""
+    """Three-part naming: database.schema.identifier → '`gold`.dbo.dim_customers'.
+
+    Note: upstream v1.9.6 changed quote_policy.database from False to True
+    to fix mixed-case lakehouse name ApproximateMatchError. Database is now
+    backtick-quoted in render().
+    """
     rel = FabricSparkRelation.create(
         database="gold",
         schema="dbo",
         identifier="dim_customers",
     )
-    assert rel.render() == "gold.dbo.dim_customers"
+    assert rel.render() == "`gold`.dbo.dim_customers"
 
 
 def test_four_part_relation_render() -> None:
-    """Four-part naming: workspace.database.schema.identifier → 'analytics_ws.gold.dbo.dim_customers'."""
+    """Four-part naming: workspace.database.schema.identifier with database quoted."""
     rel = FabricSparkRelation.create(
         workspace="analytics_ws",
         database="gold",
         schema="dbo",
         identifier="dim_customers",
     )
-    assert rel.render() == "analytics_ws.gold.dbo.dim_customers"
+    # workspace and database are both quoted (both rendered with q_db flag)
+    assert rel.render() == "`analytics_ws`.`gold`.dbo.dim_customers"
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +128,7 @@ def test_without_workspace() -> None:
 
     assert three_part.workspace is None
     assert three_part.is_four_part is False
-    assert three_part.render() == "gold.dbo.dim_customers"
+    assert three_part.render() == "`gold`.dbo.dim_customers"
 
 
 def test_with_workspace() -> None:
@@ -136,7 +142,7 @@ def test_with_workspace() -> None:
 
     assert four_part.workspace == "analytics_ws"
     assert four_part.is_four_part is True
-    assert four_part.render() == "analytics_ws.gold.dbo.dim_customers"
+    assert four_part.render() == "`analytics_ws`.`gold`.dbo.dim_customers"
 
 
 # ---------------------------------------------------------------------------
@@ -145,13 +151,16 @@ def test_with_workspace() -> None:
 
 
 def test_render_dotted_database() -> None:
-    """database='workspace.lakehouse' without workspace → renders as four parts."""
+    """database='workspace.lakehouse' without workspace → renders as four parts.
+
+    Both parts of the dotted database get backtick-quoted (database quote policy).
+    """
     rel = FabricSparkRelation.create(
         database="workspace.lakehouse",
         schema="dbo",
         identifier="t",
     )
-    assert rel.render() == "workspace.lakehouse.dbo.t"
+    assert rel.render() == "`workspace`.`lakehouse`.dbo.t"
 
 
 # ---------------------------------------------------------------------------

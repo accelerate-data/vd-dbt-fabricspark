@@ -11,13 +11,18 @@ dbt_env/
 dist/
 *.egg-info
 logs/
+*.patch
 
+# Temporary
+.temp/
 
 # Unit test
 .tox/
 .env
 test.env
 
+# Warehouse
+warehouse/
 
 # Django stuff
 *.log
@@ -318,7 +323,6 @@ test.env
 
 # Temp
 .temp/*
-
 # Livy session persistence files (created at runtime)
 livy-session-id.txt
 livy-session-id.txt.lock
@@ -330,7 +334,17 @@ changes/
 dd.txt
 prompts/
 
-# Node.js (not a Node project)
+# Node.js
 node_modules/
 package.json
 package-lock.json
+
+# Test logs (upstream)
+logs/**/*
+!logs/test-runs/
+!logs/test-runs/README.md
+logs/test-runs/report.json
+logs/test-runs/report.md
+
+# nx
+.nx/*

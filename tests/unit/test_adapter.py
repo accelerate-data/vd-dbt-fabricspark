@@ -157,7 +157,9 @@ class TestSparkAdapter(unittest.TestCase):
         input_cols = [Row(keys=["col_name", "data_type"], values=r) for r in plain_rows]
 
         config = self._get_target_livy(self.project_cfg)
-        rows = FabricSparkAdapter(config, self.mp_context).parse_describe_extended(relation, input_cols)
+        rows = FabricSparkAdapter(config, self.mp_context).parse_describe_extended(
+            relation, input_cols
+        )
         self.assertEqual(len(rows), 4)
         self.assertEqual(
             rows[0].to_column_dict(omit_none=False),
@@ -246,7 +248,9 @@ class TestSparkAdapter(unittest.TestCase):
         input_cols = [Row(keys=["col_name", "data_type"], values=r) for r in plain_rows]
 
         config = self._get_target_livy(self.project_cfg)
-        rows = FabricSparkAdapter(config, self.mp_context).parse_describe_extended(relation, input_cols)
+        rows = FabricSparkAdapter(config, self.mp_context).parse_describe_extended(
+            relation, input_cols
+        )
 
         self.assertEqual(rows[0].to_column_dict().get("table_owner"), "1234")
 
@@ -282,7 +286,9 @@ class TestSparkAdapter(unittest.TestCase):
         input_cols = [Row(keys=["col_name", "data_type"], values=r) for r in plain_rows]
 
         config = self._get_target_livy(self.project_cfg)
-        rows = FabricSparkAdapter(config, self.mp_context).parse_describe_extended(relation, input_cols)
+        rows = FabricSparkAdapter(config, self.mp_context).parse_describe_extended(
+            relation, input_cols
+        )
         self.assertEqual(len(rows), 1)
         self.assertEqual(
             rows[0].to_column_dict(omit_none=False),
@@ -342,8 +348,8 @@ class TestSparkAdapter(unittest.TestCase):
             # include_policy.database should be True
             assert rel.include_policy.database is True
             assert rel.include_policy.schema is True
-            # Renders as database.schema.identifier (three-part)
-            assert str(rel) == "my_lakehouse.dbo.my_table"
+            # Renders as `database`.schema.identifier (three-part, database quoted)
+            assert str(rel) == "`my_lakehouse`.dbo.my_table"
         finally:
             FabricSparkRelation._schemas_enabled = False
 
@@ -351,17 +357,78 @@ class TestSparkAdapter(unittest.TestCase):
         """Test that changing the ClassVar affects new relations, not existing ones."""
         FabricSparkRelation._schemas_enabled = False
         try:
-            rel_two = FabricSparkRelation.create(
-                database="lh", schema="lh", identifier="t1"
-            )
+            rel_two = FabricSparkRelation.create(database="lh", schema="lh", identifier="t1")
             FabricSparkRelation._schemas_enabled = True
-            rel_three = FabricSparkRelation.create(
-                database="lh", schema="dbo", identifier="t2"
-            )
+            rel_three = FabricSparkRelation.create(database="lh", schema="dbo", identifier="t2")
             # Existing relation retains its original policy
             assert str(rel_two) == "lh.t1"
-            # New relation uses updated policy
-            assert str(rel_three) == "lh.dbo.t2"
+            # New relation uses updated policy (database quoted)
+            assert str(rel_three) == "`lh`.dbo.t2"
+        finally:
+            FabricSparkRelation._schemas_enabled = False
+
+    def test_mixed_case_database_no_approximate_match_error(self):
+        """Regression test for ApproximateMatchError when lakehouse name uses mixed case.
+
+        When the Fabric lakehouse displayName contains uppercase characters
+        (e.g. 'DBTTest'), the relation cache stores relations with the
+        case-preserved database name from the catalog.  Before the fix,
+        FabricSparkQuotePolicy.database was False, which caused
+        _make_match_kwargs to lowercase the search term ('dbttest'), while
+        the cached relation kept the original casing ('DBTTest').  This
+        mismatch triggered ApproximateMatchError on every rerun.
+
+        The fix sets FabricSparkQuotePolicy.database to True so dbt
+        preserves the original casing through the cache-lookup path.
+        """
+        FabricSparkRelation._schemas_enabled = True
+        try:
+            # Simulate a cached relation returned by Fabric's catalog with
+            # case-preserved lakehouse name (as list_relations_without_caching
+            # populates it).
+            cached_relation = FabricSparkRelation.create(
+                database="DBTTest",
+                schema="dbo",
+                identifier="my_first_model",
+                type=FabricSparkRelation.get_relation_type.Table,
+            )
+
+            # Verify that the quote policy defaults database to True
+            assert cached_relation.quote_policy.database is True
+
+            # The search term that dbt passes through _make_match_kwargs.
+            # With quoting.database=True, the database name is NOT lowercased,
+            # so it stays as "DBTTest" and matches exactly.
+            assert cached_relation.matches(
+                database="DBTTest", schema="dbo", identifier="my_first_model"
+            )
+
+            # Also verify that mixed-case database renders correctly
+            # with backtick quoting (harmless in Spark SQL).
+            assert str(cached_relation) == "`DBTTest`.dbo.my_first_model"
+        finally:
+            FabricSparkRelation._schemas_enabled = False
+
+    def test_mixed_case_database_lowered_raises_approximate_match(self):
+        """Verify that searching with a lowered database name vs. mixed-case
+        cached relation correctly raises ApproximateMatchError, confirming
+        the root cause described in the issue."""
+        from dbt_common.exceptions import CompilationError
+
+        FabricSparkRelation._schemas_enabled = True
+        try:
+            cached_relation = FabricSparkRelation.create(
+                database="DBTTest",
+                schema="dbo",
+                identifier="my_first_model",
+                type=FabricSparkRelation.get_relation_type.Table,
+            )
+            # Searching with the lowered form should raise ApproximateMatchError
+            # (which is a CompilationError subclass) since 'dbttest' != 'DBTTest'.
+            with self.assertRaises(CompilationError):
+                cached_relation.matches(
+                    database="dbttest", schema="dbo", identifier="my_first_model"
+                )
         finally:
             FabricSparkRelation._schemas_enabled = False
 
@@ -425,7 +492,9 @@ class TestSparkAdapter(unittest.TestCase):
         )
 
         config = self._get_target_livy(self.project_cfg)
-        columns = FabricSparkAdapter(config, self.mp_context).parse_columns_from_information(relation)
+        columns = FabricSparkAdapter(config, self.mp_context).parse_columns_from_information(
+            relation
+        )
         self.assertEqual(len(columns), 4)
         self.assertEqual(
             columns[0].to_column_dict(omit_none=False),
@@ -510,7 +579,9 @@ class TestSparkAdapter(unittest.TestCase):
         )
 
         config = self._get_target_livy(self.project_cfg)
-        columns = FabricSparkAdapter(config, self.mp_context).parse_columns_from_information(relation)
+        columns = FabricSparkAdapter(config, self.mp_context).parse_columns_from_information(
+            relation
+        )
         self.assertEqual(len(columns), 4)
         self.assertEqual(
             columns[1].to_column_dict(omit_none=False),
@@ -576,7 +647,9 @@ class TestSparkAdapter(unittest.TestCase):
         )
 
         config = self._get_target_livy(self.project_cfg)
-        columns = FabricSparkAdapter(config, self.mp_context).parse_columns_from_information(relation)
+        columns = FabricSparkAdapter(config, self.mp_context).parse_columns_from_information(
+            relation
+        )
         self.assertEqual(len(columns), 4)
 
         self.assertEqual(
@@ -629,264 +702,33 @@ class TestSparkAdapter(unittest.TestCase):
             },
         )
 
-
-class TestOneLakeRelationTypeParsing(unittest.TestCase):
-    """Tests for OneLake-specific relation type parsing.
-
-    OneLake's OnelakeExternalCatalog returns specific table types that need
-    to be properly mapped to dbt's RelationType enum.
-    """
-
-    def setUp(self):
-        flags.STRICT_MODE = False
-        self.mp_context = get_context("spawn")
-        self.project_cfg = {
-            "name": "X",
-            "version": "0.1",
-            "profile": "test",
-            "project-root": "/tmp/dbt/does-not-exist",
-            "quoting": {"identifier": False, "schema": False},
-            "config-version": 2,
-        }
-
-    def _get_config(self):
-        return config_from_parts_or_dicts(
-            self.project_cfg,
-            {
-                "outputs": {
-                    "test": {
-                        "type": "fabricspark",
-                        "method": "livy",
-                        "authentication": "CLI",
-                        "schema": "dbtsparktest",
-                        "lakehouse": "dbtsparktest",
-                        "workspaceid": "1de8390c-9aca-4790-bee8-72049109c0f4",
-                        "lakehouseid": "8c5bc260-bc3a-4898-9ada-01e433d461ba",
-                        "connect_retries": 0,
-                        "connect_timeout": 10,
-                        "threads": 1,
-                        "endpoint": "https://dailyapi.fabric.microsoft.com/v1",
-                        "spark_config": {"name": "test-session"},
-                    }
-                },
-                "target": "test",
-            },
-        )
-
-    def test_parse_relation_type_managed(self):
-        """MANAGED tables should map to RelationType.Table"""
-        config = self._get_config()
-        adapter = FabricSparkAdapter(config, self.mp_context)
-        information = "Type: MANAGED\nProvider: delta\n"
-        result = adapter._parse_relation_type(information)
-        self.assertEqual(result, RelationType.Table)
-
-    def test_parse_relation_type_external(self):
-        """EXTERNAL tables should map to RelationType.Table"""
-        config = self._get_config()
-        adapter = FabricSparkAdapter(config, self.mp_context)
-        information = "Type: EXTERNAL\nProvider: delta\n"
-        result = adapter._parse_relation_type(information)
-        self.assertEqual(result, RelationType.Table)
-
-    def test_parse_relation_type_materialized_lake_view(self):
-        """MATERIALIZED_LAKE_VIEW should map to RelationType.Table"""
-        config = self._get_config()
-        adapter = FabricSparkAdapter(config, self.mp_context)
-        information = "Type: MATERIALIZED_LAKE_VIEW\nProvider: delta\n"
-        result = adapter._parse_relation_type(information)
-        self.assertEqual(result, RelationType.Table)
-
-    def test_parse_relation_type_view(self):
-        """VIEW should map to RelationType.View"""
-        config = self._get_config()
-        adapter = FabricSparkAdapter(config, self.mp_context)
-        information = "Type: VIEW\n"
-        result = adapter._parse_relation_type(information)
-        self.assertEqual(result, RelationType.View)
-
-    def test_parse_relation_type_table(self):
-        """TABLE should map to RelationType.Table"""
-        config = self._get_config()
-        adapter = FabricSparkAdapter(config, self.mp_context)
-        information = "Type: TABLE\nProvider: delta\n"
-        result = adapter._parse_relation_type(information)
-        self.assertEqual(result, RelationType.Table)
-
-    def test_parse_relation_type_unknown_defaults_to_table(self):
-        """Unknown types should default to RelationType.Table"""
-        config = self._get_config()
-        adapter = FabricSparkAdapter(config, self.mp_context)
-        information = "Type: UNKNOWN_TYPE\nProvider: delta\n"
-        result = adapter._parse_relation_type(information)
-        self.assertEqual(result, RelationType.Table)
-
-    def test_parse_relation_type_case_insensitive(self):
-        """Type parsing should be case-insensitive"""
-        config = self._get_config()
+    def test_build_spark_relation_list_materialized_lake_view(self):
+        """MATERIALIZED_LAKE_VIEW from Fabric should be classified as MaterializedView."""
+        config = self._get_target_livy(self.project_cfg)
         adapter = FabricSparkAdapter(config, self.mp_context)
 
-        # lowercase
-        information = "Type: managed\nProvider: delta\n"
-        result = adapter._parse_relation_type(information)
-        self.assertEqual(result, RelationType.Table)
-
-        # mixed case
-        information = "Type: Managed\nProvider: delta\n"
-        result = adapter._parse_relation_type(information)
-        self.assertEqual(result, RelationType.Table)
-
-    def test_parse_relation_type_legacy_view_detection(self):
-        """Should fall back to legacy 'Type: VIEW' string detection"""
-        config = self._get_config()
-        adapter = FabricSparkAdapter(config, self.mp_context)
-        # Legacy format without regex match
-        information = "Some info\nType: VIEW\nMore info"
-        result = adapter._parse_relation_type(information)
-        self.assertEqual(result, RelationType.View)
-
-    def test_parse_relation_type_no_type_defaults_to_table(self):
-        """Missing type information should default to RelationType.Table"""
-        config = self._get_config()
-        adapter = FabricSparkAdapter(config, self.mp_context)
-        information = "Provider: delta\nLocation: /mnt/data"
-        result = adapter._parse_relation_type(information)
-        self.assertEqual(result, RelationType.Table)
-
-
-class TestFourPartNaming(unittest.TestCase):
-    """Tests for Fabric Spark SQL four-part naming support.
-
-    Fabric Spark SQL natively supports four-part naming:
-        workspace.lakehouse.schema.table
-    """
-
-    def test_two_part_relation_render(self):
-        """Two-part naming: lakehouse.table"""
-        relation = FabricSparkRelation.create(
-            schema="my_lakehouse",
-            identifier="my_table",
-        )
-        self.assertEqual(relation.render(), "my_lakehouse.my_table")
-        self.assertTrue(relation.is_two_part)
-        self.assertFalse(relation.is_three_part)
-        self.assertFalse(relation.is_four_part)
-
-    def test_three_part_relation_render(self):
-        """Three-part naming: lakehouse.schema.table"""
-        relation = FabricSparkRelation.create(
-            database="my_lakehouse",
-            schema="dbo",
-            identifier="my_table",
-        )
-        self.assertEqual(relation.render(), "my_lakehouse.dbo.my_table")
-        self.assertFalse(relation.is_two_part)
-        self.assertTrue(relation.is_three_part)
-        self.assertFalse(relation.is_four_part)
-
-    def test_four_part_relation_render(self):
-        """Four-part naming: workspace.lakehouse.schema.table"""
-        relation = FabricSparkRelation.create(
-            workspace="analytics_workspace",
-            database="gold_lakehouse",
-            schema="dbo",
-            identifier="dim_customers",
-        )
-        self.assertEqual(
-            relation.render(),
-            "analytics_workspace.gold_lakehouse.dbo.dim_customers"
-        )
-        self.assertFalse(relation.is_two_part)
-        self.assertFalse(relation.is_three_part)
-        self.assertTrue(relation.is_four_part)
-        self.assertTrue(relation.is_cross_workspace)
-
-    def test_four_part_with_workspace_method(self):
-        """Test with_workspace() method creates four-part relation"""
-        # Start with three-part
-        relation = FabricSparkRelation.create(
-            database="my_lakehouse",
-            schema="dbo",
-            identifier="my_table",
-        )
-        self.assertFalse(relation.is_four_part)
-
-        # Add workspace
-        four_part = relation.with_workspace("remote_workspace")
-        self.assertTrue(four_part.is_four_part)
-        self.assertEqual(
-            four_part.render(),
-            "remote_workspace.my_lakehouse.dbo.my_table"
+        schema_relation = FabricSparkRelation.create(
+            database="mydb", schema="dbo", identifier="dummy"
         )
 
-    def test_four_part_without_workspace_method(self):
-        """Test without_workspace() method removes workspace"""
-        relation = FabricSparkRelation.create(
-            workspace="analytics_workspace",
-            database="gold_lakehouse",
-            schema="dbo",
-            identifier="dim_customers",
-        )
-        self.assertTrue(relation.is_four_part)
+        def fake_info(row):
+            return row
 
-        # Remove workspace
-        three_part = relation.without_workspace()
-        self.assertFalse(three_part.is_four_part)
-        self.assertTrue(three_part.is_three_part)
-        self.assertEqual(three_part.render(), "gold_lakehouse.dbo.dim_customers")
+        rows = [
+            ("dbo", "mlv_table", "Type: MATERIALIZED_LAKE_VIEW\nProvider: delta\n"),
+            ("dbo", "mv_table", "Type: MATERIALIZED_VIEW\nProvider: delta\n"),
+            ("dbo", "view_table", "Type: VIEW\nProvider: delta\n"),
+            ("dbo", "regular_table", "Type: MANAGED\nProvider: delta\n"),
+        ]
 
-    def test_cross_workspace_property(self):
-        """Test is_cross_workspace property"""
-        # Local relation
-        local = FabricSparkRelation.create(
-            schema="my_lakehouse",
-            identifier="my_table",
-        )
-        self.assertFalse(local.is_cross_workspace)
-
-        # Cross-workspace relation
-        remote = FabricSparkRelation.create(
-            workspace="other_workspace",
-            database="other_lakehouse",
-            schema="dbo",
-            identifier="other_table",
-        )
-        self.assertTrue(remote.is_cross_workspace)
-
-    def test_relation_with_same_database_schema(self):
-        """When database equals schema, should be two-part naming"""
-        relation = FabricSparkRelation.create(
-            database="my_lakehouse",
-            schema="my_lakehouse",
-            identifier="my_table",
-        )
-        # When database == schema, it's effectively two-part
-        self.assertTrue(relation.is_two_part)
-
-    def test_four_part_cross_workspace_join_scenario(self):
-        """Test scenario for cross-workspace joins"""
-        # Table in workspace A
-        table_a = FabricSparkRelation.create(
-            workspace="sales_workspace",
-            database="transactions_lh",
-            schema="dbo",
-            identifier="orders",
+        relations = adapter._build_spark_relation_list(
+            row_list=rows,
+            relation_info_func=fake_info,
+            schema_relation=schema_relation,
         )
 
-        # Table in workspace B
-        table_b = FabricSparkRelation.create(
-            workspace="analytics_workspace",
-            database="gold_lh",
-            schema="dbo",
-            identifier="dim_customers",
-        )
-
-        # Both should render as four-part names for cross-workspace join
-        self.assertEqual(
-            table_a.render(),
-            "sales_workspace.transactions_lh.dbo.orders"
-        )
-        self.assertEqual(
-            table_b.render(),
-            "analytics_workspace.gold_lh.dbo.dim_customers"
-        )
+        self.assertEqual(len(relations), 4)
+        self.assertEqual(relations[0].type, RelationType.MaterializedView)
+        self.assertEqual(relations[1].type, RelationType.MaterializedView)
+        self.assertEqual(relations[2].type, RelationType.View)
+        self.assertEqual(relations[3].type, RelationType.Table)
